@@ -43,7 +43,7 @@ def main() -> None:
     ap.add_argument('--out_dir', required=True)
     ap.add_argument('--gpus', type=int, default=8)
     ap.add_argument('--free_mb', type=int, default=51200, help='空闲显存门控（默认 50G）')
-    ap.add_argument('--batch_size', type=int, default=5)
+    ap.add_argument('--batch_size', type=int, default=4, help='ODE 批大小（B=5 差分注意力双 fp32 矩阵 OOM，2026-09-26）')
     ap.add_argument('--max_retry', type=int, default=2)
     ap.add_argument('--poll_s', type=float, default=20.0)
     args = ap.parse_args()
@@ -91,8 +91,11 @@ def main() -> None:
                        '--gene', gene, '--n_steps', str(n),
                        '--out_dir', out_dir, '--gpu', str(g),
                        '--batch_size', str(args.batch_size)]
+                env = dict(os.environ)
+                # 差分注意力双 fp32 矩阵碎片化 OOM 的解药（PyTorch 官方建议）
+                env['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
                 proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
-                                        start_new_session=True)
+                                        start_new_session=True, env=env)
             procs[g] = (task, proc)
             print(f'[scan:{HOST}] spawn g{g}: {gene} n={n} ({len(pending)} left)', flush=True)
         time.sleep(args.poll_s)
