@@ -220,14 +220,17 @@ def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[s
         rhat[:, tpos] = -np.inf
         mean_cts = (src_raw[:, modeled_pos_full].toarray().astype(np.float64)
                     * np.power(2.0, rhat.astype(np.float64)))
-        counts = np.random.default_rng(
+        # 全轴恢复（2026-09-27 fix）：建模基因 <- Poisson 采样，非建模基因 <- 对照原样；
+        # var 轴 = 全轴 11919，X 必须同宽（旧桥 log1p_bridge_to_counts 同语义）
+        counts_full = src_raw.toarray().astype(np.float32)
+        counts_full[:, modeled_pos_full] = np.random.default_rng(
             stable_seed(cfg.heldout_line, pert, cfg.seed + 7)).poisson(mean_cts).astype(np.float32)
-        obs_g = pd.DataFrame({'target_gene': [pert] * counts.shape[0],
-                              'context': [cfg.heldout_line] * counts.shape[0],
-                              'target': [pert] * counts.shape[0]})
-        rows.append(sparse.csr_matrix(counts))
+        obs_g = pd.DataFrame({'target_gene': [pert] * counts_full.shape[0],
+                              'context': [cfg.heldout_line] * counts_full.shape[0],
+                              'target': [pert] * counts_full.shape[0]})
+        rows.append(sparse.csr_matrix(counts_full))
         obs_rows.append(obs_g)
-        ad.AnnData(X=sparse.csr_matrix(counts, dtype=np.float32), obs=obs_g,
+        ad.AnnData(X=sparse.csr_matrix(counts_full, dtype=np.float32), obs=obs_g,
                    var=var_df).write_h5ad(part_path)
         print(f'pred: {len(rows)}/{len(perts)} genes done', flush=True)
 
