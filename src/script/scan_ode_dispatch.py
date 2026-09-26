@@ -82,7 +82,8 @@ def main() -> None:
                 continue
             task = pending.pop(0)
             gene, n = task
-            log = os.path.join(log_dir, f'{HOST}_g{g:02d}_{gene}_n{n}.log')
+            # 任务级日志（不嵌 GPU：同任务重试会换 GPU，任务级文件跨尝试追加，一任务一文件）
+            log = os.path.join(log_dir, f'{gene}_n{n}.log')
             with open(log, 'a') as lf:
                 cmd = [sys.executable, '-u', 'src/script/scan_ode_convergence.py',
                        '--checkpoint_path', args.checkpoint_path,
