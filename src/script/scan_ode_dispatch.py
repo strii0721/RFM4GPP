@@ -118,7 +118,7 @@ def main() -> None:
             del procs[g]
 
     print(f'[scan:{HOST}] all tasks finished. 报告模式：', flush=True)
-    print(f'  {sys.executable} -u src/script/scan_ode_convergence.py --report 1 '
+    print(f'  {sys.executable} -u src/script/scan_ode_convergence.py --report '
           f'--genes {args.genes} --n_list {args.n_list} --out_dir {out_dir}', flush=True)
 
 
