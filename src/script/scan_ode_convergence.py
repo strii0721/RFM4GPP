@@ -61,6 +61,7 @@ class ScanConfig(FlowConfig):
     n_list: str = '12,25,50,100,200'
     threshold: float = 0.005   # 推荐判据：Δx 均值 < 此值（log2FC 单位）
     top_infer_genes: int = 11919  # 建模基因数（与 BenchConfig 同，select_modeled_genes 需要）
+    mask_fname: str = ''       # artifact_paths 需要（空=按 split_method/topk 派生）
 
 
 def _load_model(cfg: ScanConfig, device):
