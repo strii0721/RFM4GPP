@@ -186,7 +186,9 @@ def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[s
     parts_dir = os.path.join(cfg.out_dir, 'predparts')
     os.makedirs(parts_dir, exist_ok=True)
     tag = f'_{cfg.pred_tag}' if cfg.pred_tag else ''
-    var_df = pd.DataFrame(index=real.var_names)
+    # astype(str)：reuse_real 路径 real 为 backed 读入，var 索引是 nullable StringArray，
+    # anndata 默认拒绝写（旧轮 real 内存构建=普通 str 无此问题）
+    var_df = pd.DataFrame(index=real.var_names.astype(str))
     for i, pert in enumerate(perts):
         part_path = os.path.join(parts_dir, f'pred{tag}_g{i:03d}.h5ad')
         if os.path.exists(part_path):
@@ -237,7 +239,7 @@ def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[s
     X = sparse.vstack(rows).tocsr()
     obs_df = pd.concat(obs_rows, ignore_index=True)
     pred = ad.AnnData(X=X.astype(np.float32), obs=obs_df,
-                      var=pd.DataFrame(index=real.var_names))
+                      var=pd.DataFrame(index=real.var_names.astype(str)))
     print(f'pred: {X.shape[0]} cells x {X.shape[1]} genes ({len(perts)} genes)', flush=True)
     return pred
 
