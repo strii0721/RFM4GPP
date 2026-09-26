@@ -32,6 +32,7 @@ import pandas as pd
 import scanpy as sc
 import torch
 import tyro
+from dataclasses import dataclass
 
 from config.config_flow import FlowConfig
 from src.models.instantiate_model import instantiate_model
@@ -45,6 +46,7 @@ from src.script.generate_submission import (
 )
 
 
+@dataclass
 class ScanConfig(FlowConfig):
     checkpoint_path: str = ''
     real_path: str = ''        # 复用 benchmark 轮次的 real.h5ad（含 4000 NTC 对照）
