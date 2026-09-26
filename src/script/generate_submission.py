@@ -150,22 +150,28 @@ def _ode_forward(vf, gene_ids, x, t, src_b, pid_b, device,
 
 
 def ode_predict(vf, gene_ids, src_modeled, pert_id_b, batch_size, ode_steps,
-                noise_type, poisson_alpha, poisson_target_sum, device, clamp_output=True):
+                noise_type, poisson_alpha, poisson_target_sum, device, clamp_output=True,
+                noise=None):
     """从控制谱生成扰动预测：噪声源与训练一致 → ODE t:0→1 → （可选 clamp≥0）。
 
     clamp_output：旧范式目标=log1p 表达（非负）需 clamp；残差目标范式（2026-09-26）
-    目标=中心化 log2FC 残差（可负），必须 False。"""
+    目标=中心化 log2FC 残差（可负），必须 False。
+    noise：固定初始噪声 (n_cells, L)（ODE 步数收敛性扫描用——同基因跨 N 共用，
+    使解差只反映 Euler 截断误差）；None = 随机 randn（benchmark 常规路径）。"""
     L = gene_ids.shape[0]
     preds = []
     with torch.no_grad():
         for s in range(0, src_modeled.shape[0], batch_size):
             src_b = src_modeled[s:s + batch_size].contiguous()
             pid_b = pert_id_b.repeat(src_b.shape[0], 1)
-            if noise_type == 'Poisson':
-                noise = make_lognorm_poisson_noise(
+            if noise is not None:
+                nb = noise[s:s + batch_size].to(src_b.device)
+            elif noise_type == 'Poisson':
+                noise_ = make_lognorm_poisson_noise(
                     target_log=src_b, alpha=poisson_alpha, per_cell_L=poisson_target_sum)
+                nb = noise_
             else:
-                noise = torch.randn(src_b.shape[0], L, device=device)
+                nb = torch.randn(src_b.shape[0], L, device=device)
             # 2026-09-19 加速：基因编码/对照值编码/扰动编码与 t 无关，在 ODE 的
             # 100 个 Euler 步之间完全重复——每批只算一次（与逐步重算同算子同
             # autocast，数值一致；仅推理路径，训练侧不受影响）。
@@ -177,7 +183,7 @@ def ode_predict(vf, gene_ids, src_modeled, pert_id_b, batch_size, ode_steps,
             traj = torchdiffeq.odeint(
                 lambda t, x: _ode_forward(vf, gene_ids, x, t, src_b, pid_b, device,
                                           gene_emb_c, value_emb_2_c, pert_emb_c),
-                noise,
+                nb,
                 torch.linspace(0, 1, ode_steps, device=device),
                 atol=1e-4, rtol=1e-4, method='euler',
             )
