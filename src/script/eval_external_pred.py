@@ -65,6 +65,8 @@ def main() -> None:
     print(f'after +ctl: {pred.shape[0]} cells', flush=True)
 
     pred = _subsample_pred(pred, cfg.n_real_cells, cfg.seed)
+    # _run_eval 的 baseline CLI 需要 out_dir/real.h5ad（eval_only 流程里 real 本来就在 out_dir）
+    real.write_h5ad(os.path.join(cfg.out_dir, 'real.h5ad'))
     _run_eval(cfg, real, pred)
 
 
