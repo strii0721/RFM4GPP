@@ -9,10 +9,10 @@ import numpy as np
 import pandas as pd
 
 import anndata as ad
-from config.config_flow import VCC_REMOTE_CONTROLS_DIR
+from config.config import CommonConfig
 
 path = sys.argv[1]
-controls_dir = sys.argv[2] if len(sys.argv) > 2 else VCC_REMOTE_CONTROLS_DIR
+controls_dir = sys.argv[2] if len(sys.argv) > 2 else CommonConfig().controls_dir
 
 a = ad.read_h5ad(path)
 X = a.X.tocsr()

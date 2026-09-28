@@ -2,7 +2,7 @@ import accelerate
 import torch
 import torch.nn as nn
 import tyro
-from config.config_flow import FlowConfig as Config
+from config.config import FlowConfig as Config
 import torch.nn.functional as F
 import time
 from torch.utils.data import Dataset, DataLoader

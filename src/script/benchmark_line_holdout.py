@@ -35,7 +35,7 @@ import torch
 import tyro
 from scipy import sparse
 
-from config.config_flow import FlowConfig
+from config.config import FlowConfig
 from src.models.instantiate_model import instantiate_model
 from src.tokenizer.gene_tokenizer import GeneVocab
 from src.script.generate_submission import (

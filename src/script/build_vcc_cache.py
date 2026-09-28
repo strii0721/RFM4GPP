@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import tyro
 
-from config.config_flow import FlowConfig
+from config.config import FlowConfig
 from src.data_process.data import Data
 from src.utils.utils import process_vocab
 

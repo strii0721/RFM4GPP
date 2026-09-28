@@ -7,7 +7,7 @@
 #   GPUS=1 bash scripts/train.sh       # 单卡
 #   STEPS=200 bash scripts/train.sh    # 覆盖步数
 #   TOP_INFER=11919 bash scripts/train.sh  # 训练每步建模基因数 L（默认 11919=全轴；min 到缓存列 11,371）
-# 训练超参走 config/config_flow.py 默认值（VCC 主线已收口）；训练语料必须显式传入
+# 训练超参走 config/config.py 默认值（VCC 主线已收口）；训练语料必须显式传入
 # （2026-09-27 定案：不再硬编码数据集，缓存/mask/vocab 派生键含语料文件名）:
 #   bash scripts/train.sh --corpus_paths /path/a.h5ad /path/b.h5ad
 # 其他覆盖直接追加 tyro 参数:

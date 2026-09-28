@@ -34,7 +34,7 @@ import torch
 import tyro
 from dataclasses import dataclass
 
-from config.config_flow import FlowConfig
+from config.config import FlowConfig
 from src.models.instantiate_model import instantiate_model
 from src.tokenizer.gene_tokenizer import GeneVocab
 from src.script.benchmark_line_holdout import _norm_log1p

@@ -29,7 +29,7 @@ import torchdiffeq
 from scipy import sparse
 from dataclasses import dataclass
 
-from config.config_flow import FlowConfig, VCC_REMOTE_CONTROLS_DIR
+from config.config import CommonConfig, FlowConfig
 from src.models.instantiate_model import instantiate_model
 from src.tokenizer.gene_tokenizer import GeneVocab
 from src.utils.utils import make_lognorm_poisson_noise
@@ -39,7 +39,7 @@ ODEDEF_STEPS = 100  # 论文：Euler K=100 均匀步（附录 A.4.3）
 
 @dataclass
 class GenConfig(FlowConfig):
-    controls_dir: str = VCC_REMOTE_CONTROLS_DIR  # dir with context_{A,B,C}.h5ad + gene_names.csv
+    controls_dir: str = CommonConfig().controls_dir  # dir with context_{A,B,C}.h5ad + gene_names.csv
     mask_fname: str = ''  # '' = 按训练同款公式派生（cache/vcc/mask_fold_...）
     out_dir: str = ''           # partial h5ad 输出目录
     shard_id: int = 0

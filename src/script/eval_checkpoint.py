@@ -20,7 +20,7 @@ import tyro
 from accelerate import Accelerator
 
 import src.script.run as runner
-from config.config_flow import FlowConfig
+from config.config import FlowConfig
 from src.data_process.data import Data
 from src.models.instantiate_model import instantiate_model
 from src.utils.utils import process_vocab

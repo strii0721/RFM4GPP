@@ -3,17 +3,23 @@ from dataclasses import dataclass, field
 import os
 from datetime import datetime
 
-VCC_REMOTE_RESOURCE_ROOT = '/home/ict2/Projects/vcc-2026/resources/datasets'
-VCC_REMOTE_CORPUS_PATH = os.path.join(
-    VCC_REMOTE_RESOURCE_ROOT, 'train_merged', 'train_merged_panel.h5ad'
-)
-VCC_REMOTE_CONTROLS_DIR = os.path.join(VCC_REMOTE_RESOURCE_ROOT, 'controls')
-VCC_REMOTE_PANEL_PATH = os.path.join(VCC_REMOTE_CONTROLS_DIR, 'pert_counts.csv')
 
-# 2026-09-27 用户定案：训练集不再硬编码任何数据集常量（不限于 replogle+nadig），
-# 语料路径一律经 --corpus_paths 显式传入。panel / 测试语料是 VCC-2026 竞赛固定
-# 基础设施（300 panel 清单、RPE1 留系真实侧），与训练语料选择无关，默认值直接
-# 指向竞赛文件（可用 CLI 覆盖）。
+@dataclass
+class CommonConfig:
+    """公共路径配置（2026-09-27 用户定案：原 config_flow.py 模块级常量迁入此类）。
+
+    训练集不再硬编码任何数据集（不限于 replogle+nadig），语料路径一律经
+    --corpus_paths 显式传入；本类仅承载 VCC-2026 竞赛固定基础设施
+    （官方合并语料、controls 目录、官方 300 panel 清单）与资源根目录。
+    """
+    resource_root: str = '/home/ict2/Projects/vcc-2026/resources/datasets'
+    # 官方合并语料（train_merged；历史 gen 提交/分析用，非训练默认语料）
+    corpus_path: str = os.path.join(resource_root, 'train_merged', 'train_merged_panel.h5ad')
+    # controls 目录：context_{A,B,C}.h5ad + gene_names.csv + pert_counts.csv
+    controls_dir: str = os.path.join(resource_root, 'controls')
+    # VCC-2026 官方 300 panel 清单（竞赛固定，与训练语料无关）
+    panel_path: str = os.path.join(controls_dir, 'pert_counts.csv')
+
 
 @dataclass
 class FlowConfig:
@@ -34,7 +40,7 @@ class FlowConfig:
     test_only: bool = False
     # Perturbation related parameters
     data_name: str = "vcc"
-    perturbation_function: str = 'crisper' 
+    perturbation_function: str = 'crisper'
     noise_type: str = "Gaussian"
     poisson_alpha: float = 0.8
     poisson_target_sum: int = -1
@@ -65,23 +71,23 @@ class FlowConfig:
     # VCC-2026 mode (data_name='vcc')
     # data_path = 缓存/共表达图/split 产物根目录。2026-09-20 用户定案：项目整体
     # 迁至家目录 /home/ict2/Projects（软链接 → /share/ict2/Projects 共享盘 20T），
-    # 缓存/数据集全部随迁；语料数据集走 corpus_path。
+    # 缓存/数据集全部随迁；训练语料走 corpus_paths 显式传入。
     data_path: str = '/home/ict2/Projects/scDFM/tmp'
     # 训练语料文件列表（2026-09-27 用户定案）：支持分散在多个文件夹的多个文件，
     # 建缓存时按序读入并沿 obs 拼接（var 轴须逐文件一致）。默认空=必须显式传入，
     # 不再绑定任何数据集。CLI：--corpus_paths <p1> <p2> ...（空格分隔，遇下一 --flag 停）。
     corpus_paths: list[str] = field(default_factory=list)
-    panel_path: str = '/home/ict2/Projects/vcc-2026/resources/datasets/replogle/pert_counts.csv'  # VCC-2026 官方 300 panel 清单（竞赛固定，与训练语料无关）
+    panel_path: str = CommonConfig().panel_path  # VCC-2026 官方 300 panel 清单（竞赛固定，与训练语料无关）
     test_corpus_path: str = '/home/ict2/Projects/vcc-2026/resources/datasets/replogle/replogle_rpe1.h5ad'  # 竞赛留系真实侧（RPE1），benchmark 专用
     train_pool_path: str = ''  # 训练每步采样池（非空=基因清单；空串=整个基因轴，含 panel，2026-09-21 定案）
     line_col: str = 'context'   # replogle train 文件 context=K562/Jurkat/HepG2（obs 无 cell_line 列）
-
-    # 残差目标范式（2026-09-26 用户定案）：res_<line>.npy/rbar_p.npy/gbar.npy/combos.csv
-    # 列对齐训练缓存 11,371 基因序（genes_cache.csv）；中间缓存文件，放 tmp/ 而非 output/
+    max_len: int = 500
+    max_len_batch: int = 1000
+    heldout_line: str = 'RPE1'  # single_line 留系口径（RPE1）；whole 口径下被 test_corpus_path 取代
+    # 残差目标范式（2026-09-26 用户定案）：冻结三张量目录（rbar_c/rbar_p/gbar/res_*）
     residual_targets_dir: str = 'tmp/residual_targets'
-    heldout_line: str = 'RPE1'  # whole 切分下仅作 benchmark 的 context 标签
-    crispr_type_col: str = ''   # replogle 文件无 crispr_type 列；留空直接跳过 CRISPRi 过滤
-    crispr_type_value: str = 'CRISPRi'  # 仅当 crispr_type_col 非空时使用（data.py 过滤分支）
+    condition_token_ratio: float = 0.25  # 条件单元格采样比例（per batch）
+    condition_max_tokens: int = 400      # 条件单元格 token 上限（Perceiver 输入）
     mask_subsample: int = 50000  # cells for co-expression graph (0 = all)
     max_test_perts: int = 20  # cap on perturbations evaluated per checkpoint (0 = all)
     num_workers: int = 4  # DataLoader workers per rank
