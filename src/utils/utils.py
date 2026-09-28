@@ -101,7 +101,8 @@ def process_vocab(data_manager, config):
     if getattr(config, 'data_name', '') == 'vcc':
         # vocab is corpus-specific: key by corpus stem so switching the training
         # corpus never reuses another corpus's gene set
-        stem = os.path.splitext(os.path.basename(str(config.corpus_path)))[0]
+        stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
+                        for p in sorted(config.corpus_paths))
         pool_stem = (os.path.splitext(os.path.basename(str(config.train_pool_path)))[0]
                      if config.train_pool_path else 'all')
         vocab_fname = f'{config.data_name}_{config.n_top_genes}_{stem}_{pool_stem}_highly_vocab.json'

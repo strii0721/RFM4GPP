@@ -39,9 +39,13 @@ class Data:
             # process_data 的 vcc 分支凭 _loaded_from_cache 标记不再重复读。
             pool_stem = (os.path.splitext(os.path.basename(str(self.config.train_pool_path)))[0]
                          if self.config.train_pool_path else 'all')
+            # 多文件语料（2026-09-27）：缓存键 stem = 各文件名（去扩展名）排序后 + 拼接，
+            # 与 generate_submission.corpus_stem / process_data 的派生规则一致
+            corpus_stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
+                                   for p in sorted(self.config.corpus_paths))
             cache = os.path.join(self.data_path, self.data_name,
                                  f'processed_n{self.config.n_top_genes}_'
-                                 f'{os.path.splitext(os.path.basename(str(self.config.corpus_path)))[0]}'
+                                 f'{corpus_stem}'
                                  f'_{pool_stem}.h5ad')
             if os.path.exists(cache):
                 self._loaded_from_cache = True
@@ -76,7 +80,23 @@ class Data:
                     self.adata = sc.read_h5ad(cache)
                 print(f'##### load_data: cache hit, corpus read skipped: {cache} #####')
             else:
-                self.adata = sc.read_h5ad(self.config.corpus_path)
+                # 多文件语料（2026-09-27 用户定案）：按序全量读入、沿 obs 拼接。
+                # var 轴与 obs 列集合逐文件校验一致，不一致直接报错（缓存派生键已含各文件名）。
+                paths = list(self.config.corpus_paths)
+                assert paths, 'corpus_paths 为空'
+                parts = []
+                var0, obs0 = None, None
+                for p in paths:
+                    a = sc.read_h5ad(p)
+                    if var0 is None:
+                        var0, obs0 = list(a.var_names), list(a.obs.columns)
+                    else:
+                        assert list(a.var_names) == var0, f'var 轴不一致: {p}'
+                        assert list(a.obs.columns) == obs0, f'obs 列不一致: {p}'
+                    parts.append(a)
+                    print(f'##### load_data: corpus part {p}: {a.shape} #####')
+                self.adata = ad.concat(parts, join='outer', index_unique=None)
+                print(f'##### load_data: corpus concat {len(parts)} files -> {self.adata.shape} #####')
                 self._loaded_from_cache = False
         else:
             raise ValueError(data_name + ' is not a valid data name')
@@ -266,7 +286,8 @@ class Data:
         elif self.data_name == 'vcc':
             cfg = self.config
             assert cfg is not None, 'vcc mode requires Data(config=...)'
-            corpus_stem = os.path.splitext(os.path.basename(str(cfg.corpus_path)))[0]
+            corpus_stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
+                                   for p in sorted(cfg.corpus_paths))
             # 缓存键含采样池（2026-09-17：缓存列= train_pool_path 清单；换池须重建）
             pool_stem = (os.path.splitext(os.path.basename(str(cfg.train_pool_path)))[0]
                          if cfg.train_pool_path else 'all')
@@ -432,7 +453,8 @@ class Data:
         if self.data_name == 'vcc' and cfg is not None:
             # per-corpus mask file (graph built from this corpus's own train data);
             # signed/unsigned graphs are different artifacts -> name must differ
-            _stem = os.path.splitext(os.path.basename(str(cfg.corpus_path)))[0]
+            _stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
+                             for p in sorted(cfg.corpus_paths))
             _pool = (os.path.splitext(os.path.basename(str(cfg.train_pool_path)))[0]
                      if cfg.train_pool_path else 'all')
             _neg = '_negative_edge' if use_negative_edge else ''

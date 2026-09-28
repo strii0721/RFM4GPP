@@ -52,7 +52,9 @@ class GenConfig(FlowConfig):
 
 
 def corpus_stem(config) -> str:
-    return os.path.splitext(os.path.basename(str(config.corpus_path)))[0]
+    """多文件语料（2026-09-27）：各文件名（去扩展名）排序后 + 拼接，与 data.py 派生规则一致。"""
+    return '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
+                    for p in sorted(config.corpus_paths))
 
 
 def artifact_paths(config):

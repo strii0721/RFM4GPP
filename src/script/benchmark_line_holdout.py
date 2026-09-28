@@ -95,7 +95,7 @@ def build_real(cfg: BenchConfig) -> ad.AnnData:
     独立文件，整个文件即 heldout_line，不再按 line_col 过滤；
     否则从训练语料中按 line_col == heldout_line 提取（原留一系口径）。
     """
-    src_path = cfg.test_corpus_path or cfg.corpus_path
+    src_path = cfg.test_corpus_path or cfg.corpus_paths[0]
     a = sc.read_h5ad(src_path, backed='r')
     obs = a.obs
     if cfg.test_corpus_path:

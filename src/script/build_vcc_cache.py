@@ -33,7 +33,8 @@ def main():
     )
     # vocab: also written here so DDP ranks never race on the json file
     process_vocab(data_manager, config)
-    stem = os.path.splitext(os.path.basename(str(config.corpus_path)))[0]
+    stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
+                    for p in sorted(config.corpus_paths))
     cache = os.path.join(config.data_path, config.data_name, f'processed_n{config.n_top_genes}_{stem}.h5ad')
     mask = data_manager.mask_path
     print(f'cache+mask+vocab ready: {cache} | {mask}')

@@ -1,5 +1,5 @@
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from datetime import datetime
 
@@ -70,7 +70,10 @@ class FlowConfig:
     # 迁至家目录 /home/ict2/Projects（软链接 → /share/ict2/Projects 共享盘 20T），
     # 缓存/数据集全部随迁；语料数据集走 corpus_path。
     data_path: str = '/home/ict2/Projects/scDFM/tmp'
-    corpus_path: str = REPLOGLE_TRAIN_PATH
+    # 训练语料文件列表（2026-09-27 用户定案）：支持分散在多个文件夹的多个文件，
+    # 建缓存时按序读入并沿 obs 拼接（var 轴须逐文件一致）。
+    # CLI 覆盖：--corpus_paths <p1> <p2> ...（空格分隔，遇下一个 --flag 停止）。
+    corpus_paths: list[str] = field(default_factory=lambda: [REPLOGLE_TRAIN_PATH])
     panel_path: str = REPLOGLE_PANEL_PATH
     test_corpus_path: str = REPLOGLE_TEST_PATH  # split_method='whole' 的独立测试语料（benchmark real 侧）
     train_pool_path: str = ''  # 训练每步采样池（非空=基因清单；空串=整个基因轴，含 panel，2026-09-21 定案）
