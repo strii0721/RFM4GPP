@@ -8,6 +8,7 @@ import time
 from torch.utils.data import Dataset, DataLoader
 import random
 from src.data_process.data import Data, PerturbationDataset
+from src.script.build_cache import build_cache
 from src.flow_matching.ot import OTPlanSampler
 from src.flow_matching.path import AffineProbPath
 from src.flow_matching.solver import ODESolver
@@ -285,21 +286,11 @@ if __name__ == "__main__":
         os.dup2(log_f.fileno(), 2)
         sys.stdout = log_f
         sys.stderr = log_f
-        # 缓存/共表达 mask/vocab 必须先单进程预构建（原 build_vcc_cache.py）：
-        # 8 个 DDP rank 并发写同一 h5ad 会在 NFS 上撞 h5py 文件锁（实测
-        # BlockingIOError errno 11）。rank0 构建期间其余 rank 阻塞在下方
+        # 缓存/共表达 mask/vocab 必须先单进程预构建（逻辑在 src/script/build_cache.py，
+        # 2026-09-28 拆出；8 个 DDP rank 并发写同一 h5ad 会在 NFS 上撞 h5py 文件锁，
+        # 实测 BlockingIOError errno 11）。rank0 构建期间其余 rank 阻塞在下方
         # init_process_group，天然成为 barrier。
-        t0 = time.time()
-        data_pre = Data(config.data_path, config=config)
-        data_pre.load_data(config.data_name)
-        data_pre.process_data(
-            n_top_genes=config.n_top_genes, infer_top_gene=config.infer_top_gene,
-            split_method=config.split_method, fold=config.fold,
-            use_negative_edge=config.use_negative_edge, k=config.topk,
-        )
-        process_vocab(data_pre, config)
-        print(f'cache+mask+vocab ready in {time.time()-t0:.0f}s '
-              f'(cache={config.train_cache_dir} mask={data_pre.mask_path})', flush=True)
+        build_cache(config)
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
