@@ -38,9 +38,9 @@ from src.utils.config_utils import CommonConfig, ConfigUtils, FlowConfig
 from src.utils.utils import derive_pert_columns
 
 
-def _self_log(task: str) -> None:
-    """自建日志目录 logs/<task>_<ts>/build.log 并重定向 stdout/stderr（2026-09-26 目录规范）。"""
-    log_dir = os.path.join('logs', f'{task}_{time.strftime("%Y-%m-%d_%H-%M")}')
+def _self_log(task: str, log_base: str) -> None:
+    """自建日志目录 <log_base>/<task>_<ts>/build.log 并重定向 stdout/stderr（2026-09-26 目录规范）。"""
+    log_dir = os.path.join(log_base, f'{task}_{time.strftime("%Y-%m-%d_%H-%M")}')
     os.makedirs(log_dir, exist_ok=True)
     f = open(os.path.join(log_dir, 'build.log'), 'a', buffering=1)
     os.dup2(f.fileno(), 1)
@@ -125,7 +125,7 @@ def main() -> None:
         common.train_cache_dir,
         f'processed_n{fcfg.n_top_genes}_{stem}_{pool_stem}.h5ad.meta.h5ad')
 
-    _self_log('tensors')
+    _self_log('tensors', common.log_base_path)
     os.makedirs(out_dir, exist_ok=True)
 
     t0 = time.time()

@@ -23,8 +23,10 @@ assert f.obs_col_candidates == {
     'cell_line': ['context', 'cell_line_name'],
 }, f.obs_col_candidates
 assert f.ctrl_sentinels == ['non-targeting', 'non_targeting', 'ctrl', 'control', 'ntc', 'negative_control'], f.ctrl_sentinels
+assert f.ckpt_base_path == 'output/train', f.ckpt_base_path
+assert f.log_base_path == 'logs', f.log_base_path
 assert f.test_set_paths == '/ssd3/PubData/gene_alignment/Replogle_RPE1/Replogle_RPE1.h5ad', f.test_set_paths
-assert f.frozen_tensors_dir == '/home/ict2/Projects/scDFM/output/frozen_tensors_bad_aligned_replogle', f.frozen_tensors_dir
+assert f.frozen_tensors_dir == '/home/ict2/Projects/scDFM/output/frozen_tensors_bad_aligned_18533_replogle', f.frozen_tensors_dir
 assert f.panel_csv_path.endswith('bad_aligned_replogle/pert_counts.csv'), f.panel_csv_path
 assert f.split_method == 'whole' and f.use_mmd_loss is False
 print('[1] FlowConfig 全部值来自 YAML OK')
@@ -73,10 +75,11 @@ print('[5] 派生键 OK（缓存构建后才会命中）')
 # 6) CommonConfig 纯 YAML
 sys.argv = ['test']
 c = ConfigUtils.load(CommonConfig, use_cli=False)
-assert c.frozen_tensors_dir == '/home/ict2/Projects/scDFM/output/frozen_tensors_bad_aligned_replogle'
+assert c.frozen_tensors_dir == '/home/ict2/Projects/scDFM/output/frozen_tensors_bad_aligned_18533_replogle'
 assert c.test_set_paths.endswith('Replogle_RPE1.h5ad'), c.test_set_paths
 assert c.perturb_direction == ['CRISPRi'], c.perturb_direction
 assert c.obs_col_candidates['pert_gene'] == ['target_gene', 'perturbation'], c.obs_col_candidates
+assert c.ckpt_base_path == 'output/train' and c.log_base_path == 'logs', (c.ckpt_base_path, c.log_base_path)
 print('[6] CommonConfig 纯 YAML OK')
 
 # 7) derive_pert_columns 候选列匹配（合成三套 schema：旧式/新式/第三命名方）

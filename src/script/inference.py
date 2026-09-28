@@ -556,8 +556,8 @@ def dispatch_main() -> None:
 
     _cleanup_stale_claims(out_dir)
 
-    # worker 日志目录 = logs/<out_dir 基名>/dispatch（2026-09-26 用户定案目录规范）
-    log_dir = os.path.join('logs', os.path.basename(out_dir), 'dispatch')
+    # worker 日志目录 = <log_base>/<out_dir 基名>/dispatch（2026-09-26 用户定案目录规范）
+    log_dir = os.path.join(icfg.log_base_path, os.path.basename(out_dir), 'dispatch')
     os.makedirs(log_dir, exist_ok=True)
 
     # dispatcher 自身日志（同规范，不依赖启动方 shell 重定向）

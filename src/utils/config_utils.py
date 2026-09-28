@@ -40,6 +40,10 @@ class CommonConfig:
     obs_col_candidates: dict
     # 扰动基因列中的对照哨兵值（无 ctrl_flag 候选列时用于判定对照）。
     ctrl_sentinels: list[str]
+    # checkpoint 基路径（2026-09-28 定案：train.py 在此基名下拼 _<ts>/iteration_N）
+    ckpt_base_path: str
+    # 日志基路径（train/build_tensors/inference 三入口共用）
+    log_base_path: str
 
 
 @dataclass
@@ -66,7 +70,6 @@ class FlowConfig:
 
     print_every: int
     mode: str                # predict_y, predict_p
-    result_path: str
     perturbation_fusion_method: str  # mlp, sum
     fusion_method: str       # cross , concat, add
     infer_top_gene: int
@@ -114,6 +117,9 @@ class FlowConfig:
     # obs 语义列匹配表 + 对照哨兵值（common 节；2026-09-28 定案，derive_pert_columns 用）
     obs_col_candidates: dict
     ctrl_sentinels: list[str]
+    # checkpoint 基路径 + 日志基路径（common 节；2026-09-28 定案，train.py 拼 _<ts>/iteration_N）
+    ckpt_base_path: str
+    log_base_path: str
     condition_token_ratio: float  # 条件单元格采样比例（per batch）
     condition_max_tokens: int     # 条件单元格 token 上限（Perceiver 输入）
     mask_subsample: int       # cells for co-expression graph (0 = all)
@@ -141,8 +147,8 @@ class FlowConfig:
         # timestamp IS the experiment name: output/train_{YYYY-MM-DD_HH-MM}/
         # SCDFM_RUN_TS（train.py 启动时刻设定）保证与 logs/train_{ts} 同名对应
         ts = os.environ.get('SCDFM_RUN_TS') or datetime.now().strftime('%Y-%m-%d_%H-%M')
-        return os.path.join(os.path.dirname(self.result_path),
-                            os.path.basename(self.result_path) + '_' + ts)
+        return os.path.join(os.path.dirname(self.ckpt_base_path),
+                            os.path.basename(self.ckpt_base_path) + '_' + ts)
 
 
 class ConfigUtils:

@@ -28,15 +28,19 @@ common:
     cell_line: [context, cell_line_name]       # 细胞系列
   # 扰动基因列中的对照哨兵值（无 ctrl_flag 候选列时用于判定对照；大小写/空白不敏感）
   ctrl_sentinels: [non-targeting, non_targeting, ctrl, control, ntc, negative_control]
+  # checkpoint 基路径（2026-09-28 定案：train.py 在此基名下拼 _<ts>/iteration_N 存 checkpoint）
+  ckpt_base_path: output/train
+  # 日志基路径（2026-09-28 定案：train/build_tensors/inference 三入口共用）
+  log_base_path: logs
   # 测试集（留系真实侧，独立文件；whole 口径专用）
   test_set_paths: /ssd3/PubData/gene_alignment/Replogle_RPE1/Replogle_RPE1.h5ad
   # VCC-2026 panel 清单 CSV（bad_aligned 282 基因；竞赛固定，与训练语料无关）
   panel_csv_path: /home/ict2/Projects/vcc-2026/resources/datasets/bad_aligned_replogle/pert_counts.csv
   # 残差目标冻结张量目录（rbar_c/rbar_p/gbar/res_<line>.npy/combos.csv）
   # 2026-09-28 起：bad_aligned_replogle 282 panel 专用目录（旧 11,919 轴张量保留在 output/residual_targets）
-  frozen_tensors_dir: /home/ict2/Projects/scDFM/output/frozen_tensors_bad_aligned_replogle
+  frozen_tensors_dir: /home/ict2/Projects/scDFM/output/frozen_tensors_bad_aligned_18533_replogle
   # 训练缓存目录（processed_*.h5ad/.meta 与派生文件；2026-09-28 定案）
-  train_cache_dir: cache/train_cache
+  train_cache_dir: cache/train_cache_bad_aligned_18533
 
 # 训练参数（仅 FlowConfig 本身套用；GenConfig/BenchConfig/ScanConfig 子类不套用，
 # 它们的运行态字段走各自 schema 默认 + CLI）
@@ -57,7 +61,6 @@ flow:
   poisson_target_sum: -1
   print_every: 1000
   mode: predict_y
-  result_path: output/train
   perturbation_fusion_method: sum
   fusion_method: differential_perceiver
   infer_top_gene: 18533
