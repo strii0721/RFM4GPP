@@ -57,32 +57,42 @@ def cpm_col_mean(X, rows):
     return np.asarray(sub.T @ w).ravel() / len(w)
 
 
-def _accumulate_file(path, acc_num, acc_cnt, genes0):
-    """单文件累加 (line, pert) -> CPM 列均值加权分子/计数（跨文件合并用）。"""
+def _accumulate_file(path, acc_num, acc_cnt, genes0, cfg):
+    """单文件累加 (line, pert) -> CPM 列均值加权分子/计数（跨文件合并用）。
+
+    cfg.perturb_direction：扰动方向白名单。非空时按 exo_perturb_subtype 剔除
+    不在列表内的细胞（keep 掩码与文件行号对齐，2026-09-28 定案：与缓存构建
+    同口径）；cfg.obs_col_candidates/ctrl_sentinels 供 derive_pert_columns 匹配。
+    """
     a = ad.read_h5ad(path, backed='r')
-    obs = derive_pert_columns(a.obs)  # 新对齐语料：只读派生 target_gene/context
+    obs = derive_pert_columns(a.obs, cfg.obs_col_candidates, cfg.ctrl_sentinels)
     if genes0 is not None:
         assert list(a.var_names) == genes0, f'var 轴不一致: {path}'
     n_genes = a.n_vars
+    keep = np.ones(a.n_obs, dtype=bool)
+    if cfg.perturb_direction and 'exo_perturb_subtype' in a.obs:
+        keep = a.obs['exo_perturb_subtype'].astype(str).isin(cfg.perturb_direction).to_numpy()
     tg_all = obs['target_gene'].astype(str).to_numpy()
     ctx_all = obs['context'].astype(str).to_numpy()
-    lines = sorted(set(ctx_all))
-    print(f'[res] file {path}: {a.shape}, lines={lines}', flush=True)
+    lines = sorted(set(ctx_all[keep]))
+    print(f'[res] file {path}: {a.shape}, kept {keep.sum()}/{a.n_obs} by '
+          f'perturb_direction={cfg.perturb_direction}, lines={lines}', flush=True)
     for line in lines:
-        lm = ctx_all == line
+        lm = (ctx_all == line) & keep
         cells = np.nonzero(lm)[0]
         lo, hi = cells.min(), cells.max() + 1
         block = a[lo:hi]
         Xb = block.X.tocsr().astype(np.float32)
         tg_b = tg_all[lo:hi]
-        ntc_rows = np.nonzero(tg_b == 'non-targeting')[0]
+        k_b = keep[lo:hi]
+        ntc_rows = np.nonzero((tg_b == 'non-targeting') & k_b)[0]
         if len(ntc_rows):
             num, cnt = acc_num.get((line, 'non-targeting'), (np.zeros(n_genes), 0))
             w = 1e6 / np.maximum(np.asarray(Xb[ntc_rows].sum(axis=1)).ravel().astype(np.float64), 1.0)
             acc_num[(line, 'non-targeting')] = num + np.asarray(Xb[ntc_rows].T @ w).ravel()
             acc_cnt[(line, 'non-targeting')] = cnt + len(ntc_rows)
-        for p in sorted(set(tg_b) - {'non-targeting'}):
-            rows = np.nonzero(tg_b == p)[0]
+        for p in sorted(set(tg_b[k_b]) - {'non-targeting'}):
+            rows = np.nonzero((tg_b == p) & k_b)[0]
             w = 1e6 / np.maximum(np.asarray(Xb[rows].sum(axis=1)).ravel().astype(np.float64), 1.0)
             num, cnt = acc_num.get((line, p), (np.zeros(n_genes), 0))
             acc_num[(line, p)] = num + np.asarray(Xb[rows].T @ w).ravel()
@@ -126,7 +136,7 @@ def main() -> None:
     genes0 = None
     acc_num, acc_cnt = {}, {}
     for p in paths:
-        genes0 = _accumulate_file(p, acc_num, acc_cnt, genes0)
+        genes0 = _accumulate_file(p, acc_num, acc_cnt, genes0, fcfg)
     genes_full = genes0
     lines = sorted({k[0] for k in acc_num})
     print(f'[res] accumulated {len(acc_num)} (line, pert) combos, lines={lines}', flush=True)

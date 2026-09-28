@@ -110,7 +110,7 @@ def build_real(cfg: BenchConfig) -> ad.AnnData:
     a = sc.read_h5ad(src_path, backed='r')
     # 新对齐语料：只读派生 target_gene/context 并赋回视图（backed 模式不落盘，
     # 后续切片 a[real_mask] 才能携带派生列）
-    a.obs = derive_pert_columns(a.obs)
+    a.obs = derive_pert_columns(a.obs, cfg.obs_col_candidates, cfg.ctrl_sentinels)
     obs = a.obs
     if cfg.test_set_paths:
         line_mask = np.ones(a.n_obs, dtype=bool)  # 独立测试文件：全量即该系

@@ -88,7 +88,8 @@ class Data:
                 var0 = None
                 for p in paths:
                     a = sc.read_h5ad(p)
-                    a.obs = derive_pert_columns(a.obs)  # 新对齐语料：perturbation/is_control→target_gene、cell_line_name→context
+                    a.obs = derive_pert_columns(a.obs, self.config.obs_col_candidates,
+                                                self.config.ctrl_sentinels)
                     if var0 is None:
                         var0 = list(a.var_names)
                     else:
@@ -305,6 +306,13 @@ class Data:
                 if cfg.crispr_type_col and cfg.crispr_type_col in self.adata.obs:
                     keep = self.adata.obs[cfg.crispr_type_col].astype(str) == cfg.crispr_type_value
                     print(f'##### vcc: keeping {keep.sum()}/{self.adata.n_obs} {cfg.crispr_type_value} cells #####')
+                    self.adata = self.adata[keep].copy()
+                # 1b) 扰动方向白名单（common.perturb_direction，2026-09-28 定案）：
+                #     exo_perturb_subtype 值不在列表内的细胞剔除（空列表=不过滤）
+                if cfg.perturb_direction and 'exo_perturb_subtype' in self.adata.obs:
+                    keep = self.adata.obs['exo_perturb_subtype'].astype(str).isin(cfg.perturb_direction)
+                    print(f'##### vcc: keeping {keep.sum()}/{self.adata.n_obs} cells with '
+                          f'exo_perturb_subtype in {cfg.perturb_direction} #####')
                     self.adata = self.adata[keep].copy()
                 # 2) condition / is_control from target_gene (single 'non-targeting' label)
                 tg = self.adata.obs['target_gene'].astype(str).to_numpy()

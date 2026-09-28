@@ -7,12 +7,27 @@ common:
   # 训练语料文件列表：分散在多个文件夹的多个文件，建缓存时按序读入并沿 obs 拼接
   # （var 轴须逐文件一致）。缓存/mask/vocab 派生键含各文件名。
   # 2026-09-28 起：VCC 测试集基因轴强行对齐的语料（18,533 基因轴，只读不改；
-  # target_gene/context 由 perturbation/is_control/cell_line_name 派生）
+  # target_gene/context 由 perturbation/is_control/cell_line_name 派生）。
+  # 4 文件全列出；扰动方向筛选由下方 common.perturb_direction 在代码中执行
+  # （K562 两文件为纯 CRISPRa，当前被白名单剔除，实际训练= Nadig 两文件 39 万细胞）。
   train_set_paths:
     - /ssd3/PubData/gene_alignment/Replogle_K562_gwps/Replogle_K562_gwps.h5ad
     - /ssd3/PubData/gene_alignment/Replogle_K562_essential/Replogle_K562_essential.h5ad
     - /ssd3/PubData/gene_alignment/Nadig_Jurkat/Nadig_Jurkat.h5ad
     - /ssd3/PubData/gene_alignment/Nadig_HepG2/Nadig_HepG2.h5ad
+  # 扰动方向白名单（2026-09-28 用户定案）：训练侧只保留 exo_perturb_subtype 值
+  # 在此列表内的细胞。当前 [CRISPRi]=只留敲低（K562 CRISPRa 细胞全部剔除）；
+  # 空列表=不过滤。panel 覆盖实测：Nadig 两文件并集对 282 panel ≥20 细胞 282/282。
+  perturb_direction: [CRISPRi]
+  # obs 语义列匹配表（2026-09-28 用户定案）：不同数据集构建方表头命名相互独立，
+  # 每个语义字段按候选列表顺序取第一个匹配上的列（derive_pert_columns），
+  # 全部未命中直接报错。换新命名数据集只改这里。
+  obs_col_candidates:
+    pert_gene: [target_gene, perturbation]     # 扰动基因列
+    ctrl_flag: [is_control]                    # 对照组标记列（bool；可选，无则用哨兵值）
+    cell_line: [context, cell_line_name]       # 细胞系列
+  # 扰动基因列中的对照哨兵值（无 ctrl_flag 候选列时用于判定对照；大小写/空白不敏感）
+  ctrl_sentinels: [non-targeting, non_targeting, ctrl, control, ntc, negative_control]
   # 测试集（留系真实侧，独立文件；whole 口径专用）
   test_set_paths: /ssd3/PubData/gene_alignment/Replogle_RPE1/Replogle_RPE1.h5ad
   # VCC-2026 panel 清单 CSV（bad_aligned 282 基因；竞赛固定，与训练语料无关）
@@ -70,6 +85,10 @@ flow:
   use_bf16: true
   do_eval: false            # 多卡 DDP 下必须 false（NCCL 死锁）
   min_tgt_cells: 20
+  # CRISPR 过滤开关（2026-09-28 补回）：机制=列存在性门控（列不在 obs 则静默跳过）。
+  # 已被 common.perturb_direction 取代，保持空串禁用。
+  crispr_type_col: ''
+  crispr_type_value: ''
 
 # 推理运行态参数（2026-09-28 用户定案：inference.py 启动即 dispatch 分发，
 # 单基因推理 part 先落 .partial，全部完成后合并 predictions.h5ad 并清空 .partial；

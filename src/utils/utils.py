@@ -572,21 +572,36 @@ def sorted_pad_mask(mask, pad_size=4, gene_names=None):
     mask_padded[torch.arange(length), torch.arange(length)] = False
     return mask_padded
 
-def derive_pert_columns(obs):
-    """对齐新数据集 schema（2026-09-28 用户定案）：只读派生，不改源文件。
+def derive_pert_columns(obs, obs_col_candidates, ctrl_sentinels):
+    """按候选列名匹配派生规范 obs 列（2026-09-28 用户定案；只读，不改源文件）。
 
-    VCC 对齐语料（gene_alignment/ 下）无 target_gene/context 列，由
-      target_gene = perturbation，对照组 is_control=True → 'non-targeting'（旧口径）
-      context     = cell_line_name
-    派生；旧 replogle 文件已有 target_gene/context，直接透传。
+    不同数据集构建方表头命名相互独立，不能靠"某一列是否存在"判别 schema。
+    每个语义字段给候选列名列表（obs_col_candidates，yaml common 节配置），
+    按序取第一个匹配上的列，全部未命中直接报错：
+      pert_gene  -> target_gene（对照细胞规范化 'non-targeting'）
+      cell_line  -> context
+    对照判定：ctrl_flag 候选列存在时按其布尔值；否则按 pert_gene 列中的
+    哨兵值（ctrl_sentinels，大小写/空白不敏感）判定。
     """
-    if 'target_gene' in obs.columns:
-        return obs
-    assert {'perturbation', 'is_control', 'cell_line_name'} <= set(obs.columns), \
-        ('obs 缺扰动列（需 target_gene+context 或 perturbation+is_control+'
-         f'cell_line_name）: {list(obs.columns)}')
-    obs = obs.copy()
-    obs['target_gene'] = obs['perturbation'].astype(str).where(
-        ~obs['is_control'].fillna(False).astype(bool), 'non-targeting')
-    obs['context'] = obs['cell_line_name'].astype(str)
-    return obs
+    gene_col = next((c for c in obs_col_candidates.get('pert_gene', []) if c in obs.columns), None)
+    if gene_col is None:
+        raise KeyError(f'obs 无扰动基因列（候选 {obs_col_candidates.get("pert_gene", [])}）: {list(obs.columns)}')
+    line_col = next((c for c in obs_col_candidates.get('cell_line', []) if c in obs.columns), None)
+    if line_col is None:
+        raise KeyError(f'obs 无细胞系列（候选 {obs_col_candidates.get("cell_line", [])}）: {list(obs.columns)}')
+    sent = {str(s).strip().lower() for s in ctrl_sentinels}
+    ctrl = None
+    for c in obs_col_candidates.get('ctrl_flag', []):
+        if c in obs.columns:
+            # bool / categorical / object / 数值统一经字符串化后显式判定
+            ctrl = np.isin(obs[c].astype(str).to_numpy(), ['True', 'true', 'TRUE', '1', '1.0'])
+            break
+    g = obs[gene_col].astype(str).to_numpy()
+    if ctrl is None:
+        # pandas astype(str) 对字符串列保持 object dtype → 先转 numpy U dtype 再 char 运算
+        g_norm = np.char.strip(np.char.lower(np.asarray(g, dtype=str)))
+        ctrl = np.isin(g_norm, list(sent))
+    out = obs.copy()
+    out['target_gene'] = np.where(ctrl, 'non-targeting', g)
+    out['context'] = obs[line_col].astype(str).to_numpy()
+    return out

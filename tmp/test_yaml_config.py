@@ -16,6 +16,13 @@ assert f.train_set_paths == [
     '/ssd3/PubData/gene_alignment/Nadig_Jurkat/Nadig_Jurkat.h5ad',
     '/ssd3/PubData/gene_alignment/Nadig_HepG2/Nadig_HepG2.h5ad',
 ], f.train_set_paths
+assert f.perturb_direction == ['CRISPRi'], f.perturb_direction
+assert f.obs_col_candidates == {
+    'pert_gene': ['target_gene', 'perturbation'],
+    'ctrl_flag': ['is_control'],
+    'cell_line': ['context', 'cell_line_name'],
+}, f.obs_col_candidates
+assert f.ctrl_sentinels == ['non-targeting', 'non_targeting', 'ctrl', 'control', 'ntc', 'negative_control'], f.ctrl_sentinels
 assert f.test_set_paths == '/ssd3/PubData/gene_alignment/Replogle_RPE1/Replogle_RPE1.h5ad', f.test_set_paths
 assert f.frozen_tensors_dir == '/home/ict2/Projects/scDFM/output/frozen_tensors_bad_aligned_replogle', f.frozen_tensors_dir
 assert f.panel_csv_path.endswith('bad_aligned_replogle/pert_counts.csv'), f.panel_csv_path
@@ -68,5 +75,42 @@ sys.argv = ['test']
 c = ConfigUtils.load(CommonConfig, use_cli=False)
 assert c.frozen_tensors_dir == '/home/ict2/Projects/scDFM/output/frozen_tensors_bad_aligned_replogle'
 assert c.test_set_paths.endswith('Replogle_RPE1.h5ad'), c.test_set_paths
+assert c.perturb_direction == ['CRISPRi'], c.perturb_direction
+assert c.obs_col_candidates['pert_gene'] == ['target_gene', 'perturbation'], c.obs_col_candidates
 print('[6] CommonConfig 纯 YAML OK')
+
+# 7) derive_pert_columns 候选列匹配（合成三套 schema：旧式/新式/第三命名方）
+import pandas as pd
+import numpy as np
+from src.utils.utils import derive_pert_columns
+cand = c.obs_col_candidates
+sent = c.ctrl_sentinels
+# 旧式：target_gene + context + is_control
+o1 = pd.DataFrame({'target_gene': ['BRCA1', 'non-targeting', 'TP53'],
+                   'context': ['K562', 'K562', 'K562'],
+                   'is_control': [False, True, False]})
+d1 = derive_pert_columns(o1, cand, sent)
+assert list(d1['target_gene']) == ['BRCA1', 'non-targeting', 'TP53']
+assert list(d1['context']) == ['K562', 'K562', 'K562']
+# 新式：perturbation + cell_line_name + is_control
+o2 = pd.DataFrame({'perturbation': ['BRCA1', 'ctrl', 'TP53'],
+                   'cell_line_name': ['Jurkat'] * 3,
+                   'is_control': [False, True, False]})
+d2 = derive_pert_columns(o2, cand, sent)
+assert list(d2['target_gene']) == ['BRCA1', 'non-targeting', 'TP53']
+assert list(d2['context']) == ['Jurkat'] * 3
+# 第三命名方：gene 列叫 knocked_gene、系叫 line、无对照标记列（用哨兵值判对照）
+o3 = pd.DataFrame({'knocked_gene': ['BRCA1', 'CTRL', 'TP53'],
+                   'line': ['HepG2'] * 3})
+cand3 = {'pert_gene': ['knocked_gene'], 'cell_line': ['line'], 'ctrl_flag': []}
+d3 = derive_pert_columns(o3, cand3, ['ctrl', 'non-targeting'])
+assert list(d3['target_gene']) == ['BRCA1', 'non-targeting', 'TP53']
+assert list(d3['context']) == ['HepG2'] * 3
+# 全部候选未命中 → 报错
+try:
+    derive_pert_columns(pd.DataFrame({'x': [1]}), cand, sent)
+    raise AssertionError('候选未命中未报错')
+except KeyError:
+    pass
+print('[7] derive_pert_columns 候选匹配 OK（旧式/新式/第三命名方/未命中报错）')
 print('ALL PASS')

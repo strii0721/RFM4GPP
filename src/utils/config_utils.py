@@ -32,6 +32,14 @@ class CommonConfig:
     panel_csv_path: str
     frozen_tensors_dir: str
     train_cache_dir: str
+    # 扰动方向白名单（2026-09-28 用户定案）：训练侧只保留 exo_perturb_subtype 值
+    # 在此列表内的细胞。当前 [CRISPRi]=只留敲低；空列表=不过滤。
+    perturb_direction: list[str]
+    # obs 语义列匹配表（2026-09-28 用户定案）：不同数据集构建方表头命名相互独立，
+    # 每个语义字段按候选列表顺序取第一个匹配上的列（derive_pert_columns）。
+    obs_col_candidates: dict
+    # 扰动基因列中的对照哨兵值（无 ctrl_flag 候选列时用于判定对照）。
+    ctrl_sentinels: list[str]
 
 
 @dataclass
@@ -100,6 +108,12 @@ class FlowConfig:
     # 位置在 universal.yaml common 节配置（2026-09-28）
     frozen_tensors_dir: str
     train_cache_dir: str      # 训练缓存目录（processed_*.h5ad/.meta；common 节配置）
+    # 扰动方向白名单（common 节；2026-09-28 定案）：训练侧只保留 exo_perturb_subtype
+    # 值在此列表内的细胞。当前 [CRISPRi]=只留敲低；空列表=不过滤。
+    perturb_direction: list[str]
+    # obs 语义列匹配表 + 对照哨兵值（common 节；2026-09-28 定案，derive_pert_columns 用）
+    obs_col_candidates: dict
+    ctrl_sentinels: list[str]
     condition_token_ratio: float  # 条件单元格采样比例（per batch）
     condition_max_tokens: int     # 条件单元格 token 上限（Perceiver 输入）
     mask_subsample: int       # cells for co-expression graph (0 = all)
@@ -111,6 +125,10 @@ class FlowConfig:
     # many cells for the line to be eligible; measured 2026-09-11 on the merged
     # corpus (iscr12g+xatlas+replogle): >=20 keeps ~2,011 eligible combos
     min_tgt_cells: int
+    # CRISPR 过滤开关（2026-09-28 补回：config_flow.py→yaml 迁移时丢失，缓存重建必崩）。
+    # 已被 common.perturb_direction 取代（列表白名单，见 CommonConfig），保留仅为兼容。
+    crispr_type_col: str
+    crispr_type_value: str
 
     def __post_init__(self):
         if self.data_name == 'norman_umi_go_filtered':
