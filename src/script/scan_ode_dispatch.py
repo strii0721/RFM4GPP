@@ -37,6 +37,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--checkpoint_path', required=True)
+    ap.add_argument('--corpus_paths', nargs='*', default=[],
+                    help='训练语料文件列表（传给任务进程派生缓存/mask/vocab 键，须与训练时一致）')
     ap.add_argument('--real_path', required=True)
     ap.add_argument('--genes', required=True, help='逗号分隔 panel 基因（扫描子集）')
     ap.add_argument('--n_list', default='12,25,50,100,200')
@@ -87,6 +89,7 @@ def main() -> None:
             with open(log, 'a') as lf:
                 cmd = [sys.executable, '-u', 'src/script/scan_ode_convergence.py',
                        '--checkpoint_path', args.checkpoint_path,
+                       *(['--corpus_paths', *args.corpus_paths] if args.corpus_paths else []),
                        '--real_path', args.real_path,
                        '--gene', gene, '--n_steps', str(n),
                        '--out_dir', out_dir, '--gpu', str(g),

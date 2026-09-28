@@ -112,7 +112,7 @@ def build_real(cfg: BenchConfig) -> ad.AnnData:
 
     perts, counts = np.unique(tg[pert_mask], return_counts=True)
     keep_perts = [p for p, c in zip(perts, counts) if c >= cfg.min_real_cells]
-    # 基因范围收口到 panel 300（cfg.panel_path = REPLOGLE_DATA_DIR/pert_counts.csv，
+    # 基因范围收口到 panel 300（cfg.panel_path = VCC 官方 pert_counts.csv，
     # 用户自选——2026-09-19 实测与官方 VCC panel 零重叠；语料里有而 panel 外的扰动不参与打分）
     panel_raw = pd.read_csv(cfg.panel_path, header=None)[0].astype(str).tolist()
     panel_set = {g for g in panel_raw if g != 'target_gene'}

@@ -10,13 +10,10 @@ VCC_REMOTE_CORPUS_PATH = os.path.join(
 VCC_REMOTE_CONTROLS_DIR = os.path.join(VCC_REMOTE_RESOURCE_ROOT, 'controls')
 VCC_REMOTE_PANEL_PATH = os.path.join(VCC_REMOTE_CONTROLS_DIR, 'pert_counts.csv')
 
-# replogle train/test 语料（2026-09-17 起 scDFM 主线切到此组数据）：
-# train = K562+Jurkat+HepG2 全量；test = RPE1 独立文件（留系 benchmark 用）。
-# 两文件 var 轴一致 = /home/ict2/Projects/vcc-2026/resources/datasets/replogle/gene_names.csv 的 11,919 基因。
-REPLOGLE_DATA_DIR = '/home/ict2/Projects/vcc-2026/resources/datasets/replogle'
-REPLOGLE_TRAIN_PATH = os.path.join(REPLOGLE_DATA_DIR, 'replogle_k562_jurkat_hepg2.h5ad')
-REPLOGLE_TEST_PATH = os.path.join(REPLOGLE_DATA_DIR, 'replogle_rpe1.h5ad')
-REPLOGLE_PANEL_PATH = os.path.join(REPLOGLE_DATA_DIR, 'pert_counts.csv')
+# 2026-09-27 用户定案：训练集不再硬编码任何数据集常量（不限于 replogle+nadig），
+# 语料路径一律经 --corpus_paths 显式传入。panel / 测试语料是 VCC-2026 竞赛固定
+# 基础设施（300 panel 清单、RPE1 留系真实侧），与训练语料选择无关，默认值直接
+# 指向竞赛文件（可用 CLI 覆盖）。
 
 @dataclass
 class FlowConfig:
@@ -71,11 +68,11 @@ class FlowConfig:
     # 缓存/数据集全部随迁；语料数据集走 corpus_path。
     data_path: str = '/home/ict2/Projects/scDFM/tmp'
     # 训练语料文件列表（2026-09-27 用户定案）：支持分散在多个文件夹的多个文件，
-    # 建缓存时按序读入并沿 obs 拼接（var 轴须逐文件一致）。
-    # CLI 覆盖：--corpus_paths <p1> <p2> ...（空格分隔，遇下一个 --flag 停止）。
-    corpus_paths: list[str] = field(default_factory=lambda: [REPLOGLE_TRAIN_PATH])
-    panel_path: str = REPLOGLE_PANEL_PATH
-    test_corpus_path: str = REPLOGLE_TEST_PATH  # split_method='whole' 的独立测试语料（benchmark real 侧）
+    # 建缓存时按序读入并沿 obs 拼接（var 轴须逐文件一致）。默认空=必须显式传入，
+    # 不再绑定任何数据集。CLI：--corpus_paths <p1> <p2> ...（空格分隔，遇下一 --flag 停）。
+    corpus_paths: list[str] = field(default_factory=list)
+    panel_path: str = '/home/ict2/Projects/vcc-2026/resources/datasets/replogle/pert_counts.csv'  # VCC-2026 官方 300 panel 清单（竞赛固定，与训练语料无关）
+    test_corpus_path: str = '/home/ict2/Projects/vcc-2026/resources/datasets/replogle/replogle_rpe1.h5ad'  # 竞赛留系真实侧（RPE1），benchmark 专用
     train_pool_path: str = ''  # 训练每步采样池（非空=基因清单；空串=整个基因轴，含 panel，2026-09-21 定案）
     line_col: str = 'context'   # replogle train 文件 context=K562/Jurkat/HepG2（obs 无 cell_line 列）
 

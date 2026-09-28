@@ -124,6 +124,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--checkpoint_path', required=True)
+    ap.add_argument('--corpus_paths', nargs='*', default=[],
+                    help='训练语料文件列表（传给 worker 派生缓存/mask/vocab 键，须与训练时一致）')
     ap.add_argument('--out_dir', required=True)
     ap.add_argument('--heldout_line', default='RPE1')
     ap.add_argument('--gpus', type=int, default=7)
@@ -202,6 +204,7 @@ def main() -> None:
             os.path.join(root, '.venv/bin/python'), '-m',
             'src.script.benchmark_line_holdout',
             '--checkpoint_path', args.checkpoint_path,
+            *(['--corpus_paths', *args.corpus_paths] if args.corpus_paths else []),
             '--heldout_line', args.heldout_line,
             '--out_dir', out_dir,
             '--no_eval', '--reuse_real',
