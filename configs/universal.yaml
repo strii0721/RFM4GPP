@@ -1,0 +1,89 @@
+# scDFM 全局配置（2026-09-28 用户定案：config/config.py → configs/universal.yaml）
+# 读取方式：from src.utils.ConfigUtils import ConfigUtils, FlowConfig, CommonConfig
+#    cfg = ConfigUtils.load(FlowConfig)   # CLI 显式参数 > YAML（YAML 缺 key 直接报错）
+# 换数据集 = 改本文件的 common 节（训练集 / 测试集 / panel CSV / 冻结张量目录）。
+
+common:
+  # 训练语料文件列表：分散在多个文件夹的多个文件，建缓存时按序读入并沿 obs 拼接
+  # （var 轴须逐文件一致）。缓存/mask/vocab 派生键含各文件名。
+  # 2026-09-28 起：VCC 测试集基因轴强行对齐的语料（18,533 基因轴，只读不改；
+  # target_gene/context 由 perturbation/is_control/cell_line_name 派生）
+  train_set_paths:
+    - /ssd3/PubData/gene_alignment/Replogle_K562_gwps/Replogle_K562_gwps.h5ad
+    - /ssd3/PubData/gene_alignment/Replogle_K562_essential/Replogle_K562_essential.h5ad
+    - /ssd3/PubData/gene_alignment/Nadig_Jurkat/Nadig_Jurkat.h5ad
+    - /ssd3/PubData/gene_alignment/Nadig_HepG2/Nadig_HepG2.h5ad
+  # 测试集（留系真实侧，独立文件；whole 口径专用）
+  test_set_paths: /ssd3/PubData/gene_alignment/Replogle_RPE1/Replogle_RPE1.h5ad
+  # VCC-2026 panel 清单 CSV（bad_aligned 282 基因；竞赛固定，与训练语料无关）
+  panel_csv_path: /home/ict2/Projects/vcc-2026/resources/datasets/bad_aligned_replogle/pert_counts.csv
+  # 残差目标冻结张量目录（rbar_c/rbar_p/gbar/res_<line>.npy/combos.csv）
+  # 2026-09-28 起：bad_aligned_replogle 282 panel 专用目录（旧 11,919 轴张量保留在 output/residual_targets）
+  frozen_tensors_dir: /home/ict2/Projects/scDFM/output/frozen_tensors_bad_aligned_replogle
+  # 训练缓存目录（processed_*.h5ad/.meta 与派生文件；2026-09-28 定案）
+  train_cache_dir: cache/train_cache
+
+# 训练参数（仅 FlowConfig 本身套用；GenConfig/BenchConfig/ScanConfig 子类不套用，
+# 它们的运行态字段走各自 schema 默认 + CLI）
+flow:
+  model_type: origin
+  batch_size: 96            # 论文全局 batch=96；8 卡 DDP 时 train.py 按 batch_total/gpus 分摊每 rank
+  ntoken: 18537             # 18,533 全轴基因（VCC 测试集对齐轴）+ 4 specials
+  d_model: 512
+  lr: 5.0e-5
+  steps: 10000              # 2026-09-26 定案：残差范式 ~10k 收敛；--steps 可覆盖
+  eta_min: 1.0e-6
+  devices: "1"
+  test_only: false
+  data_name: vcc
+  perturbation_function: crisper
+  noise_type: Gaussian
+  poisson_alpha: 0.8
+  poisson_target_sum: -1
+  print_every: 1000
+  mode: predict_y
+  result_path: output/train
+  perturbation_fusion_method: sum
+  fusion_method: differential_perceiver
+  infer_top_gene: 18533
+  n_top_genes: 18533        # 2026-09-28：18,533 对齐轴全轴（缓存列=全轴，恒等对齐）
+  checkpoint_path: ''
+  gamma: 0.5                # 论文 MMD λ=0.5（残差范式 use_mmd_loss=false 未启用）
+  split_method: whole       # replogle 留系：train 全量训练，测试语料=独立 RPE1 文件
+  use_mmd_loss: false       # 残差目标范式去 MMD（2026-09-26 用户定案）
+  fold: 0
+  use_negative_edge: true   # 论文 kNN k=30 带符号相关（signed mask）
+  topk: 30
+  data_path: /home/ict2/Projects/scDFM/tmp
+  batch_total: 8              # 2026-09-28：18,533 轴 attention O(L²)≈旧轴 2.42×，B=1/卡保守起步
+  gpus: 8                     # torchrun --nproc_per_node 须与此一致；train.py 据此算每 rank batch
+  train_pool_path: ''
+  line_col: context         # replogle train 文件 context=K562/Jurkat/HepG2
+  max_len: 500
+  max_len_batch: 1000
+  heldout_line: RPE1
+  condition_token_ratio: 0.25
+  condition_max_tokens: 400
+  mask_subsample: 50000     # 共表达图采样细胞数（0=全部）
+  max_test_perts: 20
+  num_workers: 4
+  use_bf16: true
+  do_eval: false            # 多卡 DDP 下必须 false（NCCL 死锁）
+  min_tgt_cells: 20
+
+# 推理运行态参数（2026-09-28 用户定案：inference.py 启动即 dispatch 分发，
+# 单基因推理 part 先落 .partial，全部完成后合并 predictions.h5ad 并清空 .partial；
+# 积分步数等由此节配置，CLI flag 仍可覆盖）
+inference:
+  heldout_line: RPE1        # 留出系（测试集独立文件时仅作标签名）
+  ode_steps: 100            # ODE 积分步数（2026-09-26 新残差范式定案 100 步）
+  batch_size: 5             # worker 每基因推理 batch（B=5 单基因峰值 ~73GB，勿调大）
+  gpus: 8                   # dispatch 轮询的卡数（可用 < free_mb 的卡自动跳过）
+  free_mb: 51200            # 空闲显存门控（MiB）
+  poll_s: 10.0              # 轮询周期（秒）
+  max_retry: 3              # 单基因进程级失败重试上限
+  n_ctrl_cells: 4000        # real 侧对照细胞数（ODE 源细胞）
+  n_real_cells: 100         # real 侧每扰动参考细胞数上限
+  n_pred_cells: 400         # 每扰动预测细胞数（官方 400）
+  min_real_cells: 20        # real 侧每扰动最少细胞数（低于则跳过该基因）
+  seed: 42
