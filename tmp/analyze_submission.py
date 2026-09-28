@@ -3,16 +3,15 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 2026-09-28: tmp/ 下减一层
 
 import numpy as np
 import pandas as pd
 
 import anndata as ad
-from config.config import CommonConfig
 
 path = sys.argv[1]
-controls_dir = sys.argv[2] if len(sys.argv) > 2 else CommonConfig().controls_dir
+controls_dir = sys.argv[2] if len(sys.argv) > 2 else '/home/ict2/Projects/vcc-2026/resources/datasets/controls'
 
 a = ad.read_h5ad(path)
 X = a.X.tocsr()

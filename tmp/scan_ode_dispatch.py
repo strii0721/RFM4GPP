@@ -37,7 +37,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--checkpoint_path', required=True)
-    ap.add_argument('--corpus_paths', nargs='*', default=[],
+    ap.add_argument('--train_set_paths', nargs='*', default=[],
                     help='训练语料文件列表（传给任务进程派生缓存/mask/vocab 键，须与训练时一致）')
     ap.add_argument('--real_path', required=True)
     ap.add_argument('--genes', required=True, help='逗号分隔 panel 基因（扫描子集）')
@@ -50,7 +50,7 @@ def main() -> None:
     ap.add_argument('--poll_s', type=float, default=20.0)
     args = ap.parse_args()
 
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 2026-09-28: tmp/ 下减一层
     os.chdir(root)
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
@@ -87,9 +87,9 @@ def main() -> None:
             # 任务级日志（不嵌 GPU：同任务重试会换 GPU，任务级文件跨尝试追加，一任务一文件）
             log = os.path.join(log_dir, f'{gene}_n{n}.log')
             with open(log, 'a') as lf:
-                cmd = [sys.executable, '-u', 'src/script/scan_ode_convergence.py',
+                cmd = [sys.executable, '-u', 'tmp/scan_ode_convergence.py',
                        '--checkpoint_path', args.checkpoint_path,
-                       *(['--corpus_paths', *args.corpus_paths] if args.corpus_paths else []),
+                       *(['--train_set_paths', *args.train_set_paths] if args.train_set_paths else []),
                        '--real_path', args.real_path,
                        '--gene', gene, '--n_steps', str(n),
                        '--out_dir', out_dir, '--gpu', str(g),
@@ -121,7 +121,7 @@ def main() -> None:
             del procs[g]
 
     print(f'[scan:{HOST}] all tasks finished. 报告模式：', flush=True)
-    print(f'  {sys.executable} -u src/script/scan_ode_convergence.py --report '
+    print(f'  {sys.executable} -u tmp/scan_ode_convergence.py --report '
           f'--genes {args.genes} --n_list {args.n_list} --out_dir {out_dir}', flush=True)
 
 

@@ -2,7 +2,8 @@
 """VCC-2026 submission generator（log1p 单空间，2026-09-11 重构）。
 
 加载训练 ckpt，从官方 A/B/C 对照流式生成 300×3×(400 细胞) 的提交物，
-分片并行（SHARD_ID / NUM_SHARDS env），由 scripts/inference.sh 编排合并。
+分片并行（SHARD_ID / NUM_SHARDS env），由 scripts/remote_benchmark.sh 之前的
+本地推理/编排流程使用（2026-09-28 起为辅助脚本，与 tmp/ 同仓随代码同步）。
 
 每 (context, perturbation)：
   source = 400 个对照细胞（稳定种子抽样）
@@ -11,13 +12,14 @@
   lam = expm1(clip(full_log1p)) → 按源细胞深度缩放 → Poisson 出整数计数
 
 缓存/词表/共表达图一律【只读】cache/vcc/ 与 src/tokenizer/（与训练同名派生，
-缺文件直接报错提示先跑 scripts/train.sh 或 build_vcc_cache.py）；本脚本不写
+缺文件直接报错提示先跑 src/script/train.py（2026-09-28 起缓存预建并入训练入口））；
+本脚本不写
 任何缓存文件，输出仅 partial h5ad 到 --out_dir。
 """
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 2026-09-28: tmp/ 下减一层
 
 import hashlib
 import h5py
@@ -27,9 +29,9 @@ import torch
 import tyro
 import torchdiffeq
 from scipy import sparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from config.config import CommonConfig, FlowConfig
+from src.utils.config_utils import ConfigUtils, FlowConfig
 from src.models.instantiate_model import instantiate_model
 from src.tokenizer.gene_tokenizer import GeneVocab
 from src.utils.utils import make_lognorm_poisson_noise
@@ -39,22 +41,22 @@ ODEDEF_STEPS = 100  # 论文：Euler K=100 均匀步（附录 A.4.3）
 
 @dataclass
 class GenConfig(FlowConfig):
-    controls_dir: str = CommonConfig().controls_dir  # dir with context_{A,B,C}.h5ad + gene_names.csv
+    controls_dir: str = '/home/ict2/Projects/vcc-2026/resources/datasets/controls'  # context_{A,B,C}.h5ad + gene_names.csv + pert_counts.csv
     mask_fname: str = ''  # '' = 按训练同款公式派生（cache/vcc/mask_fold_...）
     out_dir: str = ''           # partial h5ad 输出目录
     shard_id: int = 0
     num_shards: int = 1
-    batch_size: int = 3  # ODE 批大小（2026-09-20 全轴 L=11,071：fp32 注意力显存墙 B≤3-4）
+    batch_size: int = field(default=3, kw_only=True)  # ODE 批大小（2026-09-20 全轴 L=11,071：fp32 注意力显存墙 B≤3-4）
     seed: int = 42
     ode_steps: int = ODEDEF_STEPS
-    top_infer_genes: int = 11919  # 建模基因数（2026-09-20 定案=全轴；select_modeled_genes 内 min 到池大小）
+    top_infer_genes: int = field(default=18533, kw_only=True)  # 建模基因数（2026-09-28 定案=18,533 对齐轴全轴；select_modeled_genes 内 min 到池大小）
     max_pairs: int = 0  # smoke: cap pairs per shard (0 = all)
 
 
 def corpus_stem(config) -> str:
     """多文件语料（2026-09-27）：各文件名（去扩展名）排序后 + 拼接，与 data.py 派生规则一致。"""
     return '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
-                    for p in sorted(config.corpus_paths))
+                    for p in sorted(config.train_set_paths))
 
 
 def artifact_paths(config):
@@ -62,14 +64,15 @@ def artifact_paths(config):
     stem = corpus_stem(config)
     pool_stem = (os.path.splitext(os.path.basename(str(config.train_pool_path)))[0]
                  if config.train_pool_path else 'all')
-    src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo/src
-    cache_dir = os.path.join(config.data_path, config.data_name)  # cache/vcc
-    cache = os.path.join(cache_dir, f'processed_n{config.n_top_genes}_{stem}_{pool_stem}.h5ad')
+    src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           'src')  # repo/src（2026-09-28 起本脚本在 tmp/，须补一层）
+    cache = os.path.join(config.train_cache_dir, f'processed_n{config.n_top_genes}_{stem}_{pool_stem}.h5ad')
+    mask_dir = os.path.join(config.data_path, config.data_name)  # mask 仍在 data_path（2026-09-28：仅缓存迁 train_cache_dir）
     if config.mask_fname:
-        mask = os.path.join(cache_dir, config.mask_fname)
+        mask = os.path.join(mask_dir, config.mask_fname)
     else:
         _neg = '_negative_edge' if config.use_negative_edge else ''
-        mask = os.path.join(cache_dir,
+        mask = os.path.join(mask_dir,
                             f'mask_fold_{config.fold}topk_{config.topk}{config.split_method}{_neg}_{stem}_{pool_stem}.pt')
     vocab = os.path.join(src_dir, 'tokenizer',
                          f'{config.data_name}_{config.n_top_genes}_{stem}_{pool_stem}_highly_vocab.json')
@@ -77,7 +80,7 @@ def artifact_paths(config):
         if not os.path.exists(p):
             raise FileNotFoundError(
                 f'{what} missing: {p}\n'
-                f'（训练/预构建会生成它：先跑 scripts/train.sh 或 '
+                f'（训练/预构建会生成它：先跑 src/script/train.py 或 '
                 f'python src/script/build_vcc_cache.py --data_name=vcc）')
     return cache, mask, vocab
 
@@ -118,12 +121,12 @@ def read_var_names(f: h5py.File):
     raise KeyError('could not read gene names from processed cache var')
 
 
-def select_modeled_genes(cache: str, panel_path: str, top_infer_genes: int,
+def select_modeled_genes(cache: str, panel_csv_path: str, top_infer_genes: int,
                          vocab: GeneVocab, pool_path: str = '') -> list[str]:
     """从 processed cache 选建模基因（2026-09-21 定案：建模基因子集 = 完整基因轴，
     含 panel——panel 是其他扰动的真实 DEG，不可排除；推理侧仅对扰动自身靶列
     置 0，KD 语义）。口径：在采样池（pool_path，空串=整个基因轴）按
-    dispersions_norm 取 top-N；2026-09-21 定案 top-N=11919 → 全部缓存列。"""
+    dispersions_norm 取 top-N；2026-09-28 定案 top-N=18533 → 全部缓存列。"""
     with h5py.File(cache, 'r') as f:
         names = read_var_names(f)
         disp = np.asarray(f['var']['dispersions_norm'][:])
@@ -216,7 +219,7 @@ def main():
     import faulthandler
     import signal
     faulthandler.register(signal.SIGUSR1)
-    config = tyro.cli(GenConfig, description=__doc__)
+    config = ConfigUtils.load(GenConfig, description=__doc__)
     assert config.checkpoint_path and os.path.exists(config.checkpoint_path)
     assert config.controls_dir and os.path.isdir(config.controls_dir)
     os.makedirs(config.out_dir, exist_ok=True)
@@ -227,7 +230,7 @@ def main():
     # 1) 只读缓存/词表/mask（与训练同名派生；缺文件报错，不生成）
     cache, mask_path, vocab_path = artifact_paths(config)
     vocab = GeneVocab.from_file(vocab_path)
-    modeled = select_modeled_genes(cache, config.panel_path, config.top_infer_genes,
+    modeled = select_modeled_genes(cache, config.panel_csv_path, config.top_infer_genes,
                                    vocab, pool_path=config.train_pool_path)
     print(f'modeled genes: {len(modeled)} (top-{config.top_infer_genes} by dispersion '
           f'within full axis − panel; panel targets zeroed at inference)', flush=True)

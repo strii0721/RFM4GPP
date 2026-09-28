@@ -22,9 +22,9 @@ import pandas as pd
 import scanpy as sc
 import anndata as ad
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 2026-09-28: tmp/ 下减一层
 
-from src.script.benchmark_line_holdout import BenchConfig, _run_eval, _subsample_pred
+from src.script.inference import BenchConfig, _run_eval, _subsample_pred
 
 if ad.settings and hasattr(ad.settings, "allow_write_nullable_strings"):
     ad.settings.allow_write_nullable_strings = True

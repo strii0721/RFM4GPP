@@ -13,21 +13,21 @@ Usage:
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 2026-09-28: tmp/ 下减一层
 
 import torch
 import tyro
 from accelerate import Accelerator
 
-import src.script.run as runner
-from config.config import FlowConfig
+import src.script.train as runner
+from src.utils.config_utils import ConfigUtils, FlowConfig
 from src.data_process.data import Data
 from src.models.instantiate_model import instantiate_model
 from src.utils.utils import process_vocab
 
 
 def main():
-    config = tyro.cli(FlowConfig, description=__doc__)
+    config = ConfigUtils.load(FlowConfig, description=__doc__)
     assert config.checkpoint_path and os.path.exists(config.checkpoint_path), "checkpoint_path required"
 
     accelerator = Accelerator()

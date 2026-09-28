@@ -25,20 +25,20 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 2026-09-28: tmp/ 下减一层
 
 import numpy as np
 import pandas as pd
 import scanpy as sc
 import torch
 import tyro
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from config.config import FlowConfig
+from src.utils.config_utils import ConfigUtils, FlowConfig
 from src.models.instantiate_model import instantiate_model
 from src.tokenizer.gene_tokenizer import GeneVocab
-from src.script.benchmark_line_holdout import _norm_log1p
-from src.script.generate_submission import (
+from src.script.inference import _norm_log1p
+from tmp.generate_submission import (
     artifact_paths,
     ode_predict,
     select_modeled_genes,
@@ -48,7 +48,7 @@ from src.script.generate_submission import (
 
 @dataclass
 class ScanConfig(FlowConfig):
-    checkpoint_path: str = ''
+    checkpoint_path: str = field(default='', kw_only=True)
     real_path: str = ''        # 复用 benchmark 轮次的 real.h5ad（含 4000 NTC 对照）
     out_dir: str = ''
     gene: str = ''             # 任务模式：单基因
@@ -60,14 +60,14 @@ class ScanConfig(FlowConfig):
     genes: str = ''            # 报告模式：逗号分隔基因
     n_list: str = '12,25,50,100,200'
     threshold: float = 0.005   # 推荐判据：Δx 均值 < 此值（log2FC 单位）
-    top_infer_genes: int = 11919  # 建模基因数（与 BenchConfig 同，select_modeled_genes 需要）
+    top_infer_genes: int = field(default=11919, kw_only=True)  # 建模基因数（与 BenchConfig 同，select_modeled_genes 需要）
     mask_fname: str = ''       # artifact_paths 需要（空=按 split_method/topk 派生）
 
 
 def _load_model(cfg: ScanConfig, device):
     cache, mask_path, vocab_path = artifact_paths(cfg)
     vocab = GeneVocab.from_file(vocab_path)
-    modeled = select_modeled_genes(cache, cfg.panel_path, cfg.top_infer_genes, vocab,
+    modeled = select_modeled_genes(cache, cfg.panel_csv_path, cfg.top_infer_genes, vocab,
                                    pool_path=cfg.train_pool_path)
     gene_ids = torch.tensor(vocab.encode(modeled), dtype=torch.long, device=device)
     vf = instantiate_model(cfg.model_type, ntoken=cfg.ntoken, d_model=cfg.d_model,
@@ -162,7 +162,7 @@ def run_report(cfg: ScanConfig) -> None:
 
 
 def main() -> None:
-    cfg = tyro.cli(ScanConfig, description=__doc__)
+    cfg = ConfigUtils.load(ScanConfig, description=__doc__)
     if cfg.report:
         run_report(cfg)
     else:

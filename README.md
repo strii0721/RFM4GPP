@@ -60,7 +60,10 @@ scDFM/
 │  └─ combosciplex.h5ad
 ├─ src/
 │  └─ ...
-└─ train.sh
+└─ scripts/
+   ├─ sync.sh
+   ├─ local_benchmark.sh
+   └─ remote_benchmark.sh
 ```
 
 
@@ -69,7 +72,7 @@ scDFM/
 
 An example on additive task.
 ```bash
-bash train.sh
+torchrun --nproc_per_node=8 -m src.script.train
 ```
 
 ## 🫡 Citation

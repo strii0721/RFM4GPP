@@ -30,6 +30,11 @@ RSYNC_OPTS=(
   --exclude=cache/
   --exclude=logs/
   --exclude=.venv/
+  # 辅助脚本目录：只同步 *.py（2026-09-28 起辅助脚本统一放 tmp/，被 local/remote
+  # benchmark 与 inference 引用，必须随代码同步）；tmp 数据文件不入库不传输
+  --include=tmp/
+  --include=tmp/*.py
+  --exclude=tmp/*
   # 逐目录应用 .gitignore 规则
   --filter=':- .gitignore'
   --rsync-path="mkdir -p ${REMOTE_DIR} && rsync"

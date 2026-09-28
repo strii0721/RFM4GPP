@@ -2,7 +2,7 @@ import accelerate
 import torch
 import torch.nn as nn
 import tyro
-from config.config import FlowConfig as Config
+from src.utils.config_utils import ConfigUtils, FlowConfig as Config
 import torch.nn.functional as F
 import time
 from torch.utils.data import Dataset, DataLoader
@@ -263,7 +263,43 @@ def generate_sample(wrapped_vf,source,condition_vec=None,vf=None,gene_ids=None,g
     return torch.clamp(traj[-1], min=0)
     
 if __name__ == "__main__":
-    config = tyro.cli(Config)
+    # ---- 训练启动入口（2026-09-28 并入原 scripts/train.sh 职责）----
+    # 环境准备：expandable_segments（全轴 B=2 反向峰值 73GB+7.7GB 瞬时分配，
+    # 不设置时碎片浪费 ~9.8GB 越 80GB 墙 OOM，torch 2.7 支持）+ 行缓冲 stdout
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(line_buffering=True)
+    # 时间戳 = 实验名（output/train_<ts>/ 与 logs/train_<ts>/ 同名对应；
+    # rank0 建日志目录并把 stdout/stderr 落 train.log）
+    ts = os.environ.get('SCDFM_RUN_TS') or datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
+    os.environ['SCDFM_RUN_TS'] = ts
+    rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
+    config = ConfigUtils.load(Config)
+    config.batch_size = config.batch_total // config.gpus  # 每 rank batch（B=2/卡）
+
+    if rank == 0:
+        log_dir = os.path.join('logs', f'train_{ts}')
+        os.makedirs(log_dir, exist_ok=True)
+        log_f = open(os.path.join(log_dir, 'train.log'), 'a', buffering=1)
+        os.dup2(log_f.fileno(), 1)
+        os.dup2(log_f.fileno(), 2)
+        sys.stdout = log_f
+        sys.stderr = log_f
+        # 缓存/共表达 mask/vocab 必须先单进程预构建（原 build_vcc_cache.py）：
+        # 8 个 DDP rank 并发写同一 h5ad 会在 NFS 上撞 h5py 文件锁（实测
+        # BlockingIOError errno 11）。rank0 构建期间其余 rank 阻塞在下方
+        # init_process_group，天然成为 barrier。
+        t0 = time.time()
+        data_pre = Data(config.data_path, config=config)
+        data_pre.load_data(config.data_name)
+        data_pre.process_data(
+            n_top_genes=config.n_top_genes, infer_top_gene=config.infer_top_gene,
+            split_method=config.split_method, fold=config.fold,
+            use_negative_edge=config.use_negative_edge, k=config.topk,
+        )
+        process_vocab(data_pre, config)
+        print(f'cache+mask+vocab ready in {time.time()-t0:.0f}s '
+              f'(cache={config.train_cache_dir} mask={data_pre.mask_path})', flush=True)
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -301,7 +337,7 @@ if __name__ == "__main__":
     train_sampler, valid_sampler, test_dl = data_manager.load_flow_data(batch_size=config.batch_size)
     
     train_dataset = PerturbationDataset(train_sampler, config.batch_size,
-                                        residual_dir=config.residual_targets_dir)
+                                        residual_dir=config.frozen_tensors_dir)
     dataloader = DataLoader(train_dataset, batch_size=1, shuffle=False,num_workers=config.num_workers,pin_memory=True,persistent_workers=True)  # batch_size=1 因为每个getitem本身就是一个batch
     # data.py computes the (per-corpus / per-fold) mask path and exposes it;
     # recomputing here would drift from the file actually built in process_data
@@ -330,8 +366,8 @@ if __name__ == "__main__":
 
     # 残差目标表（范式二，2026-09-26）：(line, pert) 冻结产物，列对齐缓存基因轴；
     # mmap 懒加载（res_K562.npy 395MB 不常驻），每 rank 各持一份共享页
-    _res_lines = sorted(pd.read_csv(os.path.join(config.residual_targets_dir, 'combos.csv'))['line'].unique())
-    _res_tables = {L: np.load(os.path.join(config.residual_targets_dir, f'res_{L}.npy'),
+    _res_lines = sorted(pd.read_csv(os.path.join(config.frozen_tensors_dir, 'combos.csv'))['line'].unique())
+    _res_tables = {L: np.load(os.path.join(config.frozen_tensors_dir, f'res_{L}.npy'),
                               mmap_mode='r') for L in _res_lines}
     assert all(t.shape[1] == gene_ids.shape[0] for t in _res_tables.values()), \
         'residual table columns != cache gene axis'
@@ -341,7 +377,7 @@ if __name__ == "__main__":
     # 训练每步基因选择的采样池（2026-09-21 用户定案）：建模基因子集 = 完整基因轴
     # （固定集合，含 panel；panel 基因是其他扰动的真实 DEG，不可排除）。
     # 默认池 = train_pool_path 的基因清单；空串回退 = 全部缓存列（11,371，含 300 panel）。
-    panel_raw = pd.read_csv(config.panel_path, header=None)[0].astype(str).tolist()
+    panel_raw = pd.read_csv(config.panel_csv_path, header=None)[0].astype(str).tolist()
     panel_genes = [g for g in panel_raw if g in set(data_manager.adata.var_names)]
     panel_ids = set(vocab.encode(panel_genes))
     panel_mask = torch.tensor([int(g) in panel_ids for g in gene_ids.tolist()],
