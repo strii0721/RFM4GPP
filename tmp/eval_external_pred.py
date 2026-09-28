@@ -25,16 +25,17 @@ import anndata as ad
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 2026-09-28: tmp/ 下减一层
 
 from src.script.inference import BenchConfig, _run_eval, _subsample_pred
+from src.utils.config_utils import ConfigUtils
 
 if ad.settings and hasattr(ad.settings, "allow_write_nullable_strings"):
     ad.settings.allow_write_nullable_strings = True
 
 
 def main() -> None:
-    cfg = BenchConfig(
-        checkpoint_path='unused',
-        out_dir=os.environ['OUT_DIR'],
-    )
+    # 配置走 universal.yaml（配置收口后 BenchConfig 无默认值，不能再直接构造；
+    # 2026-09-28 修复：local_benchmark.sh 实测 TypeError missing 58 args）
+    cfg = ConfigUtils.load(BenchConfig, use_cli=False, extra_sections=('inference',))
+    cfg.out_dir = os.environ['OUT_DIR']
     real_path = os.environ['REAL_PATH']
     pred_src = os.environ['PRED_PATH']
     os.makedirs(cfg.out_dir, exist_ok=True)
