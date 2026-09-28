@@ -41,9 +41,17 @@ class CommonConfig:
     # 扰动基因列中的对照哨兵值（无 ctrl_flag 候选列时用于判定对照）。
     ctrl_sentinels: list[str]
     # checkpoint 基路径（2026-09-28 定案：train.py 在此基名下拼 _<ts>/iteration_N）
-    ckpt_base_path: str
-    # 日志基路径（train/build_tensors/inference 三入口共用）
-    log_base_path: str
+    # 输出基目录（train checkpoint 与 inference 产物共用，2026-09-29 合并定案；
+    # 代码拼 <基目录>/<任务名>_<ts>，如 output/train_<ts>、output/inference_<ts>）
+    output_base_dir: str
+    # 日志基目录（train/build_tensors/inference 三入口共用）
+    log_base_dir: str
+    # real/pred 细胞数口径（2026-09-28 从 inference 节提取到 common：build_tensors
+    # real 侧三件套与 inference 共用；官方 context=18400 取子集控时长）
+    n_ctrl_cells: int       # real 侧对照细胞数（ODE 源 / DE 参考组）
+    n_pred_cells: int       # 每扰动预测细胞数（官方 400）
+    n_real_cells: int       # real 侧每扰动参考细胞数上限（不足用全部真实细胞）
+    min_real_cells: int     # real 侧每扰动最少细胞数（低于则跳过该基因）
 
 
 @dataclass
@@ -117,9 +125,15 @@ class FlowConfig:
     # obs 语义列匹配表 + 对照哨兵值（common 节；2026-09-28 定案，derive_pert_columns 用）
     obs_col_candidates: dict
     ctrl_sentinels: list[str]
-    # checkpoint 基路径 + 日志基路径（common 节；2026-09-28 定案，train.py 拼 _<ts>/iteration_N）
-    ckpt_base_path: str
-    log_base_path: str
+    # 输出基目录 + 日志基目录（common 节；2026-09-29 合并定案）
+    output_base_dir: str
+    log_base_dir: str
+    # real/pred 细胞数口径（common 节；2026-09-28 从 inference 节提取，
+    # build_tensors real 侧三件套与 inference 共用）
+    n_ctrl_cells: int
+    n_pred_cells: int
+    n_real_cells: int
+    min_real_cells: int
     condition_token_ratio: float  # 条件单元格采样比例（per batch）
     condition_max_tokens: int     # 条件单元格 token 上限（Perceiver 输入）
     mask_subsample: int       # cells for co-expression graph (0 = all)
@@ -143,12 +157,11 @@ class FlowConfig:
             self.n_top_genes = 5000
         path = self.make_path()
 
-    def make_path(self):
-        # timestamp IS the experiment name: output/train_{YYYY-MM-DD_HH-MM}/
-        # SCDFM_RUN_TS（train.py 启动时刻设定）保证与 logs/train_{ts} 同名对应
+    def make_path(self, task: str = 'train'):
+        # timestamp IS the experiment name: <output_base_dir>/<task>_{YYYY-MM-DD_HH-MM}/
+        # SCDFM_RUN_TS（train.py 启动时刻设定）保证与 logs/<task>_{ts} 同名对应
         ts = os.environ.get('SCDFM_RUN_TS') or datetime.now().strftime('%Y-%m-%d_%H-%M')
-        return os.path.join(os.path.dirname(self.ckpt_base_path),
-                            os.path.basename(self.ckpt_base_path) + '_' + ts)
+        return os.path.join(self.output_base_dir, f'{task}_{ts}')
 
 
 class ConfigUtils:

@@ -29,9 +29,16 @@ common:
   # 扰动基因列中的对照哨兵值（无 ctrl_flag 候选列时用于判定对照；大小写/空白不敏感）
   ctrl_sentinels: [non-targeting, non_targeting, ctrl, control, ntc, negative_control]
   # checkpoint 基路径（2026-09-28 定案：train.py 在此基名下拼 _<ts>/iteration_N 存 checkpoint）
-  ckpt_base_path: output/train
-  # 日志基路径（2026-09-28 定案：train/build_tensors/inference 三入口共用）
-  log_base_path: logs
+  # 输出基目录（train checkpoint 与 inference 产物共用；代码拼 <基目录>/<任务名>_<ts>）
+  output_base_dir: output
+  # 日志基目录（2026-09-29 定案：train/build_tensors/inference 三入口共用）
+  log_base_dir: logs
+  # real/pred 细胞数口径（2026-09-28 从 inference 节提取到 common：build_tensors
+  # real 侧三件套与 inference 共用；官方 context=18400 取子集控时长）
+  n_ctrl_cells: 4000        # real 侧对照细胞数（ODE 源 / DE 参考组）
+  n_pred_cells: 100         # 每扰动预测细胞数（2026-09-28 定案：RPE1 天然数据口径 100）
+  n_real_cells: 100         # real 侧每扰动参考细胞数上限（不足用全部真实细胞）
+  min_real_cells: 20        # real 侧每扰动最少细胞数（低于则跳过该基因）
   # 测试集（留系真实侧，独立文件；whole 口径专用）
   test_set_paths: /ssd3/PubData/gene_alignment/Replogle_RPE1/Replogle_RPE1.h5ad
   # VCC-2026 panel 清单 CSV（bad_aligned 282 基因；竞赛固定，与训练语料无关）
@@ -73,7 +80,7 @@ flow:
   use_negative_edge: true   # 论文 kNN k=30 带符号相关（signed mask）
   topk: 30
   data_path: /home/ict2/Projects/scDFM/tmp
-  batch_total: 8              # 2026-09-28：18,533 轴 attention O(L²)≈旧轴 2.42×，B=1/卡保守起步
+  batch_total: 16             # 2026-09-28 实测：B=1/卡≈32GB → B=2/卡估算 ~64GB < 80GB 安全
   gpus: 8                     # torchrun --nproc_per_node 须与此一致；train.py 据此算每 rank batch
   train_pool_path: ''
   line_col: context         # replogle train 文件 context=K562/Jurkat/HepG2
@@ -104,8 +111,4 @@ inference:
   free_mb: 51200            # 空闲显存门控（MiB）
   poll_s: 10.0              # 轮询周期（秒）
   max_retry: 3              # 单基因进程级失败重试上限
-  n_ctrl_cells: 4000        # real 侧对照细胞数（ODE 源细胞）
-  n_real_cells: 100         # real 侧每扰动参考细胞数上限
-  n_pred_cells: 400         # 每扰动预测细胞数（官方 400）
-  min_real_cells: 20        # real 侧每扰动最少细胞数（低于则跳过该基因）
   seed: 42

@@ -279,7 +279,7 @@ if __name__ == "__main__":
     config.batch_size = config.batch_total // config.gpus  # 每 rank batch（B=2/卡）
 
     if rank == 0:
-        log_dir = os.path.join(config.log_base_path, f'train_{ts}')
+        log_dir = os.path.join(config.log_base_dir, f'train_{ts}')
         os.makedirs(log_dir, exist_ok=True)
         log_f = open(os.path.join(log_dir, 'train.log'), 'a', buffering=1)
         os.dup2(log_f.fileno(), 1)

@@ -7,11 +7,12 @@ predictions.h5ad 放 out_dir/ 并清空 .partial/。积分步数等运行态参�
 configs/universal.yaml 的 inference 节读取（CLI flag 仍可覆盖）。
 
 用法（远程项目根，先 source .venv）:
-  .venv/bin/python -m src.script.inference --checkpoint_path <ckpt> --out_dir <dir>
+  .venv/bin/python -m src.script.inference --checkpoint_path <ckpt> [--out_dir <dir>]
+    # --out_dir 缺省 = <common.output_base_dir>/inference_<YYYY-MM-DD_HH-MM>
   .venv/bin/python -m src.script.inference --no_dispatch --heldout_line=HCT116 \
-      --out_dir output/benchmark/<tag> [--perts=基因子集]   # 单进程直跑（调试）
+      [--out_dir <dir>] [--perts=基因子集]   # 单进程直跑（调试）
 完成后本地评分：bash scripts/local_benchmark.sh --pred_h5ad <dir>/predictions.h5ad \
-    --real_h5ad <dir>/real.h5ad --out_dir <dir>
+    --real_h5ad <dir>/real.h5ad --out_dir <基地址>
 
 测试集取自 common.test_set_paths（即使文件含扰动细胞，推理只用其中
 扰动为对照组 non-targeting 的细胞作 ODE 源）。
@@ -59,12 +60,8 @@ if hasattr(ad.settings, "allow_write_nullable_strings"):
 @dataclass
 class BenchConfig(FlowConfig):
     out_dir: str = ''
-    n_ctrl_cells: int = 4000   # real 侧对照细胞数（DE 参考组；官方 context=18400，取子集控时长）
-    n_pred_cells: int = 400    # 每扰动预测细胞数（官方 400）
-    n_real_cells: int = 100    # real 侧每扰动参考细胞数上限（2026-09-19 用户定案：
-    # 官方 400 在 RPE1 天然数据上不可行——panel 300 全 ≥101 恰好抽满 100；
-    # 不足 100 的基因用全部真实细胞）
-    min_real_cells: int = 20   # real 侧每扰动最少细胞数（低于则跳过该基因）
+    # n_ctrl_cells/n_pred_cells/n_real_cells/min_real_cells 已提取到 common 节
+    # （2026-09-28 定案：build_tensors real 侧三件套与 inference 共用口径，CommonConfig 声明）
     max_perts: int = 0         # 冒烟上限（0=全部）
     seed: int = 42
     de_backend: str = 'pdex'   # 无 gpudge 时显式 CPU DE 后端
@@ -321,7 +318,10 @@ def main() -> None:
     cfg = ConfigUtils.load(BenchConfig, description=__doc__,
                            extra_sections=('inference',))
     assert cfg.checkpoint_path and os.path.exists(cfg.checkpoint_path), 'checkpoint_path required'
-    assert cfg.out_dir, '--out_dir required'
+    # --out_dir 缺省 → <output_base_dir>/inference_<ts>（2026-09-29 定案：
+    # 与 ckpt/log 同口径——yaml 给基目录、代码拼 ts）
+    if not cfg.out_dir:
+        cfg.out_dir = cfg.make_path('inference')
     os.makedirs(cfg.out_dir, exist_ok=True)
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -516,7 +516,8 @@ def dispatch_main() -> None:
     ap.add_argument('--checkpoint_path', required=True)
     ap.add_argument('--train_set_paths', nargs='*', default=[],
                     help='训练语料文件列表（传给 worker 派生缓存/mask/vocab 键，须与训练时一致）')
-    ap.add_argument('--out_dir', required=True)
+    ap.add_argument('--out_dir', default=None,
+                    help='推理输出目录（缺省=<output_base_dir>/inference_<ts>，yaml common 节）')
     ap.add_argument('--heldout_line', default=icfg.heldout_line)
     ap.add_argument('--gpus', type=int, default=icfg.gpus)
     ap.add_argument('--ode_steps', type=int, default=icfg.ode_steps)
@@ -530,6 +531,9 @@ def dispatch_main() -> None:
 
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     os.chdir(root)
+    # --out_dir 缺省 → <output_base_dir>/inference_<ts>（2026-09-29 定案）
+    if not args.out_dir:
+        args.out_dir = icfg.make_path('inference')
     out_dir = os.path.abspath(args.out_dir)
 
     # 已完成：合并产物存在即全部结束（resume 安全）
@@ -557,7 +561,7 @@ def dispatch_main() -> None:
     _cleanup_stale_claims(out_dir)
 
     # worker 日志目录 = <log_base>/<out_dir 基名>/dispatch（2026-09-26 用户定案目录规范）
-    log_dir = os.path.join(icfg.log_base_path, os.path.basename(out_dir), 'dispatch')
+    log_dir = os.path.join(icfg.log_base_dir, os.path.basename(out_dir), 'dispatch')
     os.makedirs(log_dir, exist_ok=True)
 
     # dispatcher 自身日志（同规范，不依赖启动方 shell 重定向）

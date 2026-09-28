@@ -12,7 +12,7 @@
 
 用法（远程项目根）：
     .venv/bin/python src/script/build_cache.py
-日志：<log_base_path>/cache_<ts>/build.log
+日志：<log_base_dir>/cache_<ts>/build.log
 """
 import datetime
 import os
@@ -43,7 +43,7 @@ def build_cache(cfg):
 def main() -> None:
     cfg = ConfigUtils.load(FlowConfig, use_cli=False)
     ts = os.environ.get('SCDFM_RUN_TS') or datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
-    log_dir = os.path.join(cfg.log_base_path, f'cache_{ts}')
+    log_dir = os.path.join(cfg.log_base_dir, f'cache_{ts}')
     os.makedirs(log_dir, exist_ok=True)
     log_f = open(os.path.join(log_dir, 'build.log'), 'a', buffering=1)
     os.dup2(log_f.fileno(), 1)

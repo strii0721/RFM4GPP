@@ -125,7 +125,7 @@ def main() -> None:
         common.train_cache_dir,
         f'processed_n{fcfg.n_top_genes}_{stem}_{pool_stem}.h5ad.meta.h5ad')
 
-    _self_log('tensors', common.log_base_path)
+    _self_log('tensors', common.log_base_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     t0 = time.time()

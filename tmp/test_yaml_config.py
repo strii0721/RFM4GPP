@@ -23,8 +23,11 @@ assert f.obs_col_candidates == {
     'cell_line': ['context', 'cell_line_name'],
 }, f.obs_col_candidates
 assert f.ctrl_sentinels == ['non-targeting', 'non_targeting', 'ctrl', 'control', 'ntc', 'negative_control'], f.ctrl_sentinels
-assert f.ckpt_base_path == 'output/train', f.ckpt_base_path
-assert f.log_base_path == 'logs', f.log_base_path
+assert f.output_base_dir == 'output', f.output_base_dir
+assert f.log_base_dir == 'logs', f.log_base_dir
+assert f.make_path('train').startswith('output/train_'), f.make_path('train')
+assert f.make_path('inference').startswith('output/inference_'), f.make_path('inference')
+assert (f.n_ctrl_cells, f.n_pred_cells, f.n_real_cells, f.min_real_cells) == (4000, 100, 100, 20)
 assert f.test_set_paths == '/ssd3/PubData/gene_alignment/Replogle_RPE1/Replogle_RPE1.h5ad', f.test_set_paths
 assert f.frozen_tensors_dir == '/home/ict2/Projects/scDFM/output/frozen_tensors_bad_aligned_18533_replogle', f.frozen_tensors_dir
 assert f.panel_csv_path.endswith('bad_aligned_replogle/pert_counts.csv'), f.panel_csv_path
@@ -79,7 +82,8 @@ assert c.frozen_tensors_dir == '/home/ict2/Projects/scDFM/output/frozen_tensors_
 assert c.test_set_paths.endswith('Replogle_RPE1.h5ad'), c.test_set_paths
 assert c.perturb_direction == ['CRISPRi'], c.perturb_direction
 assert c.obs_col_candidates['pert_gene'] == ['target_gene', 'perturbation'], c.obs_col_candidates
-assert c.ckpt_base_path == 'output/train' and c.log_base_path == 'logs', (c.ckpt_base_path, c.log_base_path)
+assert c.output_base_dir == 'output' and c.log_base_dir == 'logs', (c.output_base_dir, c.log_base_dir)
+assert (c.n_ctrl_cells, c.n_pred_cells, c.n_real_cells, c.min_real_cells) == (4000, 100, 100, 20)
 print('[6] CommonConfig 纯 YAML OK')
 
 # 7) derive_pert_columns 候选列匹配（合成三套 schema：旧式/新式/第三命名方）
