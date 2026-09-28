@@ -102,7 +102,7 @@ def process_vocab(data_manager, config):
         # vocab is corpus-specific: key by corpus stem so switching the training
         # corpus never reuses another corpus's gene set
         stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
-                        for p in sorted(config.corpus_paths))
+                        for p in sorted(config.train_set_paths))
         pool_stem = (os.path.splitext(os.path.basename(str(config.train_pool_path)))[0]
                      if config.train_pool_path else 'all')
         vocab_fname = f'{config.data_name}_{config.n_top_genes}_{stem}_{pool_stem}_highly_vocab.json'
@@ -129,7 +129,7 @@ def process_vocab(data_manager, config):
         if 'target_gene' in obs.columns:
             extra |= {g for g in obs['target_gene'].astype(str).unique()
                       if g != 'non-targeting'}
-        panel = pd.read_csv(config.panel_path, header=None)[0].astype(str).tolist()
+        panel = pd.read_csv(config.panel_csv_path, header=None)[0].astype(str).tolist()
         extra |= {g for g in panel if g != 'target_gene'}
         extra = sorted(g for g in extra if g not in set(names))
         # ⚠️ id 必须人工定序（2026-09-17 实测 IndexKernel OOB）：上游 builder 会把
@@ -571,3 +571,22 @@ def sorted_pad_mask(mask, pad_size=4, gene_names=None):
     length = mask.shape[0]
     mask_padded[torch.arange(length), torch.arange(length)] = False
     return mask_padded
+
+def derive_pert_columns(obs):
+    """对齐新数据集 schema（2026-09-28 用户定案）：只读派生，不改源文件。
+
+    VCC 对齐语料（gene_alignment/ 下）无 target_gene/context 列，由
+      target_gene = perturbation，对照组 is_control=True → 'non-targeting'（旧口径）
+      context     = cell_line_name
+    派生；旧 replogle 文件已有 target_gene/context，直接透传。
+    """
+    if 'target_gene' in obs.columns:
+        return obs
+    assert {'perturbation', 'is_control', 'cell_line_name'} <= set(obs.columns), \
+        ('obs 缺扰动列（需 target_gene+context 或 perturbation+is_control+'
+         f'cell_line_name）: {list(obs.columns)}')
+    obs = obs.copy()
+    obs['target_gene'] = obs['perturbation'].astype(str).where(
+        ~obs['is_control'].fillna(False).astype(bool), 'non-targeting')
+    obs['context'] = obs['cell_line_name'].astype(str)
+    return obs

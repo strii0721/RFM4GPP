@@ -15,7 +15,7 @@ import pdb
 import tqdm
 from random import shuffle
 from scipy import sparse
-from src.utils.utils import build_gene_coexpression_graph,sorted_pad_mask
+from src.utils.utils import build_gene_coexpression_graph,sorted_pad_mask, derive_pert_columns
 # combosciplex url: https://figshare.com/articles/dataset/combosciplex/25062230?file=44229635
 # 'norman' url = 'https://dataverse.harvard.edu/api/access/datafile/6154020'
 
@@ -42,8 +42,8 @@ class Data:
             # 多文件语料（2026-09-27）：缓存键 stem = 各文件名（去扩展名）排序后 + 拼接，
             # 与 generate_submission.corpus_stem / process_data 的派生规则一致
             corpus_stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
-                                   for p in sorted(self.config.corpus_paths))
-            cache = os.path.join(self.data_path, self.data_name,
+                                   for p in sorted(self.config.train_set_paths))
+            cache = os.path.join(self.config.train_cache_dir,
                                  f'processed_n{self.config.n_top_genes}_'
                                  f'{corpus_stem}'
                                  f'_{pool_stem}.h5ad')
@@ -82,17 +82,17 @@ class Data:
             else:
                 # 多文件语料（2026-09-27 用户定案）：按序全量读入、沿 obs 拼接。
                 # var 轴与 obs 列集合逐文件校验一致，不一致直接报错（缓存派生键已含各文件名）。
-                paths = list(self.config.corpus_paths)
-                assert paths, 'corpus_paths 为空'
+                paths = list(self.config.train_set_paths)
+                assert paths, 'train_set_paths 为空'
                 parts = []
-                var0, obs0 = None, None
+                var0 = None
                 for p in paths:
                     a = sc.read_h5ad(p)
+                    a.obs = derive_pert_columns(a.obs)  # 新对齐语料：perturbation/is_control→target_gene、cell_line_name→context
                     if var0 is None:
-                        var0, obs0 = list(a.var_names), list(a.obs.columns)
+                        var0 = list(a.var_names)
                     else:
                         assert list(a.var_names) == var0, f'var 轴不一致: {p}'
-                        assert list(a.obs.columns) == obs0, f'obs 列不一致: {p}'
                     parts.append(a)
                     print(f'##### load_data: corpus part {p}: {a.shape} #####')
                 self.adata = ad.concat(parts, join='outer', index_unique=None)
@@ -287,11 +287,11 @@ class Data:
             cfg = self.config
             assert cfg is not None, 'vcc mode requires Data(config=...)'
             corpus_stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
-                                   for p in sorted(cfg.corpus_paths))
+                                   for p in sorted(cfg.train_set_paths))
             # 缓存键含采样池（2026-09-17：缓存列= train_pool_path 清单；换池须重建）
             pool_stem = (os.path.splitext(os.path.basename(str(cfg.train_pool_path)))[0]
                          if cfg.train_pool_path else 'all')
-            cache = os.path.join(self.data_path, self.data_name,
+            cache = os.path.join(cfg.train_cache_dir,
                                  f'processed_n{n_top_genes}_{corpus_stem}_{pool_stem}.h5ad')
             os.makedirs(os.path.dirname(cache), exist_ok=True)
             if os.path.exists(cache):
@@ -419,7 +419,7 @@ class Data:
                 self.adata_test = self.adata_test[:, self.adata_test.var['highly_variable']]
             elif split_method == 'whole':
                 # 全文件训练（replogle 2026-09-17）：语料文件本身无留出；
-                # 测试语料 = 独立文件 config.test_corpus_path，由
+                # 测试语料 = 独立文件 config.test_set_paths，由
                 # benchmark_line_holdout.py 直接读取（do_eval 必须 False）。
                 # adata_test 给零行空壳，兼容 TestDataset 构造（不用其方法）。
                 self.adata.obs['mode'] = 'train'
@@ -430,7 +430,7 @@ class Data:
                 self.adata_train = self.adata
                 self.adata_test = self.adata[0:0].copy()
                 print(f'##### vcc: whole-corpus split: train {self.adata_train.n_obs} cells '
-                      f'(no internal holdout; test file: {cfg.test_corpus_path}) #####')
+                      f'(no internal holdout; test file: {cfg.test_set_paths}) #####')
             else:
                 raise ValueError(f'vcc requires split_method="single"/"single_line"/"whole", '
                                  f'got {split_method!r}')
@@ -454,7 +454,7 @@ class Data:
             # per-corpus mask file (graph built from this corpus's own train data);
             # signed/unsigned graphs are different artifacts -> name must differ
             _stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
-                             for p in sorted(cfg.corpus_paths))
+                             for p in sorted(cfg.train_set_paths))
             _pool = (os.path.splitext(os.path.basename(str(cfg.train_pool_path)))[0]
                      if cfg.train_pool_path else 'all')
             _neg = '_negative_edge' if use_negative_edge else ''
