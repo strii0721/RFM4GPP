@@ -193,32 +193,31 @@ class MultiheadDiffAttn(nn.Module):
 
         v = v.view(bsz, src_len, self.num_heads, self.head_dim)
 
-
-        q_1 = q_1.transpose(1, 2)
-        q_2 = q_2.transpose(1, 2)
-        k_1 = k_1.transpose(1, 2)
-        k_2 = k_2.transpose(1, 2)
-        q_1 *= self.scaling
-        q_2 *= self.scaling
-
-        attn_weights_1 = torch.matmul(q_1, k_1.transpose(-1, -2))
-        attn_weights_2 = torch.matmul(q_2, k_2.transpose(-1, -2))
-
-        attn_weights_1 = torch.nn.functional.softmax(attn_weights_1, dim=-1, dtype=torch.float32).type_as(
-            attn_weights_1
-        )  
-        attn_weights_2 = torch.nn.functional.softmax(attn_weights_2, dim=-1, dtype=torch.float32).type_as(
-            attn_weights_2
-        )
+        # 2026-10-03 torch 内置 flash SDPA（用户定案）：全轴 19,843 注意力 O(n²)
+        # 矩阵物化导致 CUDA OOM（B=1 峰值 ~88GB，softmax 单次 11.74GiB）。差分
+        # 注意力拆两次 flash 调用相减（共享 V，数学等价）。⚠️ flash-attn 2.7.4
+        # 第三方包在本环境输出完全错误（实测与标准实现差 3.05，疑似包/环境不匹配）；
+        # torch>=2.7 内置 FLASH_ATTENTION backend 实测正确（max diff 6.7e-3）。
+        # flash backend 只收 fp16/bf16：非半精度输入转 bf16、输出转回原 dtype。
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        _dt = q_1.dtype
+        _fdt = _dt if _dt in (torch.float16, torch.bfloat16) else torch.bfloat16
+        q_1 = q_1.transpose(1, 2).to(_fdt)
+        q_2 = q_2.transpose(1, 2).to(_fdt)
+        k_1 = k_1.transpose(1, 2).to(_fdt)
+        k_2 = k_2.transpose(1, 2).to(_fdt)
+        v = v.transpose(1, 2).to(_fdt)
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            o1 = torch.nn.functional.scaled_dot_product_attention(
+                q_1, k_1, v, scale=self.scaling)
+            o2 = torch.nn.functional.scaled_dot_product_attention(
+                q_2, k_2, v, scale=self.scaling)
 
         lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q_1)
         lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q_1)
 
         lambda_full = lambda_1 - lambda_2 + self.lambda_init
-        attn_weights = attn_weights_1 - lambda_full * attn_weights_2
-
-
-        attn = torch.matmul(attn_weights, v.transpose(1,2))
+        attn = (o1 - lambda_full * o2).to(_dt)
         # attn: (bsz, num_heads, tgt_len, head_dim)        
         attn = self.subln(attn)
         attn = attn * (1 - self.lambda_init)
