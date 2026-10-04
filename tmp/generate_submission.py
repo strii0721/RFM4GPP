@@ -49,14 +49,19 @@ class GenConfig(FlowConfig):
     batch_size: int = field(default=3, kw_only=True)  # ODE 批大小（2026-09-20 全轴 L=11,071：fp32 注意力显存墙 B≤3-4）
     seed: int = 42
     ode_steps: int = ODEDEF_STEPS
-    top_infer_genes: int = field(default=18533, kw_only=True)  # 建模基因数（2026-09-28 定案=18,533 对齐轴全轴；select_modeled_genes 内 min 到池大小）
+    top_infer_genes: int = field(default=19843, kw_only=True)  # 建模基因数（2026-09-30 定案=19,843 全轴；select_modeled_genes 内 min 到池大小）
     max_pairs: int = 0  # smoke: cap pairs per shard (0 = all)
 
 
 def corpus_stem(config) -> str:
-    """多文件语料（2026-09-27）：各文件名（去扩展名）排序后 + 拼接，与 data.py 派生规则一致。"""
-    return '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
+    """多文件语料（2026-09-27）：各文件名（去扩展名）排序后 + 拼接，与 data.py
+    派生规则一致；2026-10-03：超 80 字符 sha1 缩短（与 data.py/_corpus_stem 同口径）。"""
+    stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
                     for p in sorted(config.train_set_paths))
+    if len(stem) > 80:
+        import hashlib
+        stem = 'h' + hashlib.sha1(stem.encode()).hexdigest()[:24]
+    return stem
 
 
 def artifact_paths(config):
@@ -67,7 +72,7 @@ def artifact_paths(config):
     src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            'src')  # repo/src（2026-09-28 起本脚本在 tmp/，须补一层）
     cache = os.path.join(config.train_cache_dir, f'processed_n{config.n_top_genes}_{stem}_{pool_stem}.h5ad')
-    mask_dir = os.path.join(config.data_path, config.data_name)  # mask 仍在 data_path（2026-09-28：仅缓存迁 train_cache_dir）
+    mask_dir = config.train_cache_dir  # 2026-10-03：mask 与缓存同目录（用户定案）
     if config.mask_fname:
         mask = os.path.join(mask_dir, config.mask_fname)
     else:
@@ -76,7 +81,7 @@ def artifact_paths(config):
                             f'mask_fold_{config.fold}topk_{config.topk}{config.split_method}{_neg}_{stem}_{pool_stem}.pt')
     vocab = os.path.join(src_dir, 'tokenizer',
                          f'{config.data_name}_{config.n_top_genes}_{stem}_{pool_stem}_highly_vocab.json')
-    for p, what in [(cache, 'processed cache'), (mask, 'coexpression mask'), (vocab, 'vocab')]:
+    for p, what in [(cache + '.data.npy', 'processed cache'), (mask, 'coexpression mask'), (vocab, 'vocab')]:
         if not os.path.exists(p):
             raise FileNotFoundError(
                 f'{what} missing: {p}\n'
@@ -127,9 +132,14 @@ def select_modeled_genes(cache: str, panel_csv_path: str, top_infer_genes: int,
     含 panel——panel 是其他扰动的真实 DEG，不可排除；推理侧仅对扰动自身靶列
     置 0，KD 语义）。口径：在采样池（pool_path，空串=整个基因轴）按
     dispersions_norm 取 top-N；2026-09-28 定案 top-N=18533 → 全部缓存列。"""
-    with h5py.File(cache, 'r') as f:
+    with h5py.File(cache if os.path.exists(cache) else cache + '.meta.h5ad', 'r') as f:
         names = read_var_names(f)
-        disp = np.asarray(f['var']['dispersions_norm'][:])
+        if 'dispersions_norm' in f['var']:
+            disp = np.asarray(f['var']['dispersions_norm'][:])
+        else:
+            # 2026-10-03 流式缓存：HVG 跳过（全轴恒等），dispersions_norm 缺省；
+            # top-N=19,843=全轴时排序无关 → 全 0 保持缓存列序
+            disp = np.zeros(len(names), dtype=np.float64)
     name_set = set(names)
     pool: set | None = None
     if pool_path:
@@ -145,7 +155,9 @@ def select_modeled_genes(cache: str, panel_csv_path: str, top_infer_genes: int,
 
 def _ode_forward(vf, gene_ids, x, t, src_b, pid_b, device,
                  gene_emb_c=None, value_emb_2_c=None, pert_emb_c=None):
-    """模型前向包装：bf16 autocast，t 标量→device。缓存项=t 无关量（ODE 步间复用）。"""
+    """模型前向包装：bf16 autocast（2026-10-04 回退，fp16 实测无提速——A800 fp16/bf16
+    tensor core 同速率，profile 确认 GEMM 已走 ampere_bf16 核；bf16 指数 8 位更稳）。
+    缓存项=t 无关量（ODE 步间复用）。"""
     t_ = t.to(device)
     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
         return vf(gene_ids.repeat(x.shape[0], 1), x, t_, src_b, pid_b,

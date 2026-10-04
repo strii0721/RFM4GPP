@@ -7,10 +7,11 @@ predictions.h5ad 放 out_dir/ 并清空 .partial/。积分步数等运行态参�
 configs/universal.yaml 的 inference 节读取（CLI flag 仍可覆盖）。
 
 用法（远程项目根，先 source .venv）:
-  .venv/bin/python -m src.script.inference --checkpoint_path <ckpt> [--out_dir <dir>]
-    # --out_dir 缺省 = <common.output_base_dir>/inference_<YYYY-MM-DD_HH-MM>
+  .venv/bin/python -m src.script.inference --checkpoint_path <ckpt>
+    # 输出目录固定 = <common.output_base_dir>/inference_<YYYY-MM-DD_HH-MM>（无 --out_dir flag）
   .venv/bin/python -m src.script.inference --no_dispatch --heldout_line=HCT116 \
-      [--out_dir <dir>] [--perts=基因子集]   # 单进程直跑（调试）
+      [--perts=基因子集]   # 单进程直跑（调试）
+  # 复跑/续跑锚定同一输出目录：SCDFM_RUN_TS=<ts> .venv/bin/python -m src.script.inference --checkpoint_path <ckpt>
 完成后本地评分：bash scripts/local_benchmark.sh --pred_h5ad <dir>/predictions.h5ad \
     --real_h5ad <dir>/real.h5ad --out_dir <基地址>
 
@@ -59,6 +60,9 @@ if hasattr(ad.settings, "allow_write_nullable_strings"):
 
 @dataclass
 class BenchConfig(FlowConfig):
+    # 内部输出目录（2026-09-29 定案）：main/dispatch 一律无条件覆盖为
+    # make_path('inference')=<output_base_dir>/inference_<ts>，CLI 值被忽略；
+    # eval_external_pred 等工具脚本也借此字段注入目录
     out_dir: str = ''
     # n_ctrl_cells/n_pred_cells/n_real_cells/min_real_cells 已提取到 common 节
     # （2026-09-28 定案：build_tensors real 侧三件套与 inference 共用口径，CommonConfig 声明）
@@ -67,11 +71,12 @@ class BenchConfig(FlowConfig):
     de_backend: str = 'pdex'   # 无 gpudge 时显式 CPU DE 后端
     allow_degenerate_baseline: bool = False  # baseline 锚点退化（如 lfc_nmae 显著集 <10 门控）时仍写出
     # 提交侧同款（generate_submission.GenConfig 亦有此二项）
-    top_infer_genes: int = field(default=18533, kw_only=True)  # 建模基因数（2026-09-28 定案=18,533 对齐轴全轴；select_modeled_genes 内 min 到池大小）
+    top_infer_genes: int = field(default=19843, kw_only=True)  # 建模基因数（2026-09-30 定案=19,843 全轴；select_modeled_genes 内 min 到池大小）
     ode_steps: int = 100
     mask_fname: str = ''  # artifact_paths 需要该字段（空=按 split_method/topk 派生）
     # 多卡分片（2026-09-15：单卡串行 286 基因 ODE ~4min/基因太慢，8 卡分片）
     perts: str = ''          # 逗号分隔基因子集；空=全部（配合 no_eval 空串=仅 prep real+perts.txt）
+    context: str = ''        # 推理 context（2026-09-30 多 control 源定案）：worker 只取该 context 对照
     no_eval: bool = False    # 只构建 pred 不跑三件套（分片 worker）
     eval_only: bool = False  # 跳过构建：拼接 out_dir/pred*.h5ad + real.h5ad 后跑三件套
     pred_tag: str = ''       # 分片文件名后缀 -> pred_{tag}.h5ad
@@ -96,13 +101,46 @@ def _run_cli(args: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def build_real(cfg: BenchConfig) -> ad.AnnData:
+def build_real(cfg: BenchConfig, include_perts: bool = True) -> ad.AnnData:
     """heldout_line 真实细胞：对照子采样 + 全部（≥min_real_cells 的）扰动，raw counts。
+
+    include_perts=False：仅对照（2026-09-29 定案，dispatch 用——worker 的 ODE 源
+    只需要对照，扰动基因名由 --perts flag 驱动；完整版由 benchmark.sh 构建）。
 
     test_set_paths 非空（split_method='whole'，replogle 2026-09-17）：测试语料是
     独立文件，整个文件即 heldout_line，不再按 line_col 过滤；
     否则从训练语料中按 line_col == heldout_line 提取（原留一系口径）。
     """
+    # 推理 control 多源（2026-09-30 用户定案）：include_perts=False 且配置了
+    # inference_control_paths 时，对照逐文件取 target_gene=='non-targeting' 细胞、
+    # 保留各文件原生 context 标签（官方 A/B/C 语义）；完整版（benchmark 用，
+    # 对照+扰动参考）仍走 test_set_paths 旧口径。
+    if not include_perts and cfg.inference_control_paths:
+        rng = np.random.default_rng(cfg.seed)
+        segs = []
+        for p in cfg.inference_control_paths:
+            a = sc.read_h5ad(p, backed='r')
+            a.obs = derive_pert_columns(a.obs, cfg.obs_col_candidates, cfg.ctrl_sentinels)
+            tg = a.obs['target_gene'].astype(str).to_numpy()
+            idx = np.nonzero(tg == 'non-targeting')[0]
+            sel = np.sort(rng.choice(idx, size=min(cfg.n_ctrl_cells, len(idx)),
+                                     replace=False))
+            seg = a[sel].to_memory().copy()
+            a.file.close()
+            segs.append(seg)
+        real = ad.concat(segs, join='outer', index_unique=None)
+        real.obs['target'] = real.obs['target_gene'].astype(str)
+        # 轴对齐到训练轴（2026-09-30：官方 controls 为 18,533 轴、训练轴 19,843；
+        # 缺失基因补 0 列，列序按 frozen_tensors_dir/genes_cache.csv）
+        axis_genes = pd.read_csv(
+            os.path.join(cfg.frozen_tensors_dir, 'genes_cache.csv'))['gene'].tolist()
+        real = _align_var_axis(real, axis_genes)
+        ctxs = sorted(set(real.obs['context'].astype(str)))
+        print(f'real(controls only, {len(cfg.inference_control_paths)} sources): '
+              f'{real.shape[0]} cells x {real.shape[1]} genes, contexts={ctxs}',
+              flush=True)
+        return real
+
     src_path = cfg.test_set_paths or cfg.train_set_paths[0]
     a = sc.read_h5ad(src_path, backed='r')
     # 新对齐语料：只读派生 target_gene/context 并赋回视图（backed 模式不落盘，
@@ -121,26 +159,28 @@ def build_real(cfg: BenchConfig) -> ad.AnnData:
     ctl_idx = np.nonzero(ctl_mask)[0]
     ctl_sel = np.sort(rng.choice(ctl_idx, size=min(cfg.n_ctrl_cells, len(ctl_idx)), replace=False))
 
-    perts, counts = np.unique(tg[pert_mask], return_counts=True)
-    keep_perts = [p for p, c in zip(perts, counts) if c >= cfg.min_real_cells]
-    # 基因范围收口到 panel 300（cfg.panel_csv_path = VCC 官方 pert_counts.csv，
-    # 用户自选——2026-09-19 实测与官方 VCC panel 零重叠；语料里有而 panel 外的扰动不参与打分）
-    panel_raw = pd.read_csv(cfg.panel_csv_path, header=None)[0].astype(str).tolist()
-    panel_set = {g for g in panel_raw if g != 'target_gene'}
-    keep_perts = [p for p in keep_perts if p in panel_set]
-    if cfg.max_perts:
-        keep_perts = keep_perts[:cfg.max_perts]
-
-    # 每扰动参考细胞数 = min(n_real_cells, 实际)（2026-09-19 用户定案：官方参考
-    # 400/基因，RPE1 天然数据多数基因不足；100 时 panel 300 个全部抽满）
     sel_pert = []
+    keep_perts: list[str] = []
     n_capped = 0
-    for p in keep_perts:
-        idx_p = np.nonzero((tg == p) & pert_mask)[0]
-        n = min(cfg.n_real_cells, len(idx_p))
-        if n == cfg.n_real_cells:
-            n_capped += 1
-        sel_pert.append(np.sort(rng.choice(idx_p, size=n, replace=False)))
+    if include_perts:
+        perts, counts = np.unique(tg[pert_mask], return_counts=True)
+        keep_perts = [p for p, c in zip(perts, counts) if c >= cfg.min_real_cells]
+        # 基因范围收口到 panel 300（cfg.panel_csv_path = VCC 官方 pert_counts.csv，
+        # 用户自选——2026-09-19 实测与官方 VCC panel 零重叠；语料里有而 panel 外的扰动不参与打分）
+        panel_raw = pd.read_csv(cfg.panel_csv_path, header=None)[0].astype(str).tolist()
+        panel_set = {g for g in panel_raw if g != 'target_gene'}
+        keep_perts = [p for p in keep_perts if p in panel_set]
+        if cfg.max_perts:
+            keep_perts = keep_perts[:cfg.max_perts]
+
+        # 每扰动参考细胞数 = min(n_real_cells, 实际)（2026-09-19 用户定案：官方参考
+        # 400/基因，RPE1 天然数据多数基因不足；100 时 panel 300 个全部抽满）
+        for p in keep_perts:
+            idx_p = np.nonzero((tg == p) & pert_mask)[0]
+            n = min(cfg.n_real_cells, len(idx_p))
+            if n == cfg.n_real_cells:
+                n_capped += 1
+            sel_pert.append(np.sort(rng.choice(idx_p, size=n, replace=False)))
     pert_idx = np.concatenate(sel_pert) if sel_pert else np.array([], dtype=int)
 
     real_mask = np.zeros(a.n_obs, dtype=bool)
@@ -149,9 +189,24 @@ def build_real(cfg: BenchConfig) -> ad.AnnData:
     real = a[real_mask].to_memory().copy()
     real.obs['context'] = cfg.heldout_line
     real.obs['target'] = real.obs['target_gene'].astype(str)
-    print(f'real: {real.shape[0]} cells = {len(ctl_sel)} ctl + {len(pert_idx)} pert '
-          f'({len(keep_perts)} genes, {n_capped} capped at {cfg.n_real_cells})', flush=True)
+    if include_perts:
+        print(f'real: {real.shape[0]} cells = {len(ctl_sel)} ctl + {len(pert_idx)} pert '
+              f'({len(keep_perts)} genes, {n_capped} capped at {cfg.n_real_cells})', flush=True)
+    else:
+        print(f'real(controls only): {real.shape[0]} cells', flush=True)
     return real
+
+
+def _align_var_axis(real: ad.AnnData, target_genes: list[str]) -> ad.AnnData:
+    """var 重排到 target 轴：缺失基因补 0 列、多余列丢弃，列序 = target 序。"""
+    pos = {g: i for i, g in enumerate(real.var_names.astype(str))}
+    idx = np.array([pos.get(g, -1) for g in target_genes], dtype=np.int64)
+    valid = idx >= 0
+    Xv = real.X[:, idx[valid]]
+    out = sparse.lil_matrix((real.n_obs, len(target_genes)), dtype=real.X.dtype)
+    out[:, valid] = Xv
+    return ad.AnnData(X=out.tocsr(), obs=real.obs.copy(),
+                      var=pd.DataFrame(index=target_genes))
 
 
 def _norm_log1p(raw: sparse.csr_matrix) -> sparse.csr_matrix:
@@ -164,10 +219,17 @@ def _norm_log1p(raw: sparse.csr_matrix) -> sparse.csr_matrix:
 
 
 def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[str],
-               real: ad.AnnData, device) -> ad.AnnData:
+               real: ad.AnnData, device, context: str = '') -> ad.AnnData:
     """从 heldout_line 对照生成扰动预测：ODE → Reŝ → r̂ = r̄_p − ḡ + Reŝ（r̄_c=0）→
-    Poisson(ctrl × 2^{r̂}) counts（范式二，2026-09-26）。"""
-    ctl_idx_all = np.nonzero((real.obs['target_gene'].astype(str) == 'non-targeting').to_numpy())[0]
+    Poisson(ctrl × 2^{r̂}) counts（范式二，2026-09-26）。
+
+    context 非空（2026-09-30 多 control 源定案）：ODE 源=real 中该 context 的对照、
+    pred 标签与 Poisson 种子均用该 context；空=heldout_line 旧口径。
+    """
+    ctx = context or cfg.heldout_line
+    ctx_mask = real.obs['context'].astype(str).to_numpy() == ctx
+    ctl_idx_all = np.nonzero(
+        ((real.obs['target_gene'].astype(str).to_numpy() == 'non-targeting') & ctx_mask))[0]
     ctl_raw = real.X[ctl_idx_all].tocsr()          # raw counts 子矩阵
     ctl_norm = _norm_log1p(ctl_raw)                # log1p(CP10k)
 
@@ -184,11 +246,14 @@ def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[s
     gene_axis_pos = {g: i for i, g in enumerate(real.var_names)}
     # 对照子矩阵的列轴 = 全轴（real 未做过列过滤）
     modeled_pos_full = np.array([gene_axis_pos[g] for g in modeled], dtype=np.int64)
-    assert all(p in gene_axis_pos for p in
-               set(real.obs['target_gene'].astype(str)) - {'non-targeting'}), \
+    # 扰动基因名：worker 由 --perts flag 驱动（2026-09-29 定案——real 为纯对照时
+    # 不含扰动列）；单进程直跑无 --perts 时退回 real 实际扰动集
+    if cfg.perts:
+        perts = [p for p in cfg.perts.split(',') if p]
+    else:
+        perts = sorted(p for p in real.obs['target_gene'].astype(str).unique() if p != 'non-targeting')
+    assert all(p in gene_axis_pos for p in perts), \
         'perturbation target gene missing from real var axis (zero-target invariant broken)'
-
-    perts = sorted(p for p in real.obs['target_gene'].astype(str).unique() if p != 'non-targeting')
     rng = np.random.default_rng(cfg.seed)
     rows, obs_rows = [], []
     # 每基因立即落盘（2026-09-23 用户定案）：进程被杀不丢已完成基因；
@@ -226,9 +291,15 @@ def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[s
 
         # 残差恢复（范式二，2026-09-26）：r̂ = r̄_p − ḡ + Reŝ（r̄_c(RPE1)=0），
         # counts ~ Poisson(ctrl × 2^{r̂})；靶基因 r̂=−inf → 2^{−inf}=0 → KD 语义
-        assert pert in rbar_p_perts, f'{pert} missing from training rbar_p'
-        p_row = rbar_p_perts.index(pert)
-        rhat = (rbar_p[p_row][None, :] - gbar[None, :]) + pred_modeled   # (n, L)
+        if pert in rbar_p_perts:
+            p_row = rbar_p_perts.index(pert)
+            rbar_p_row = rbar_p[p_row][None, :]
+        else:
+            # 2026-10-04 方案 A（用户定案）：零样本扰动（训练语料未扰动过的靶，
+            # 如 panel 中 DNTTIP1/EEF1A2/EPHB2/FZD2/MSANTD4/NT5DC1）无 r̄_p 行——
+            # 取 0 → r̂ = Reŝ（ḡ≈0 实测 mean -2.6e-8，可忽略），纯残差预测。
+            rbar_p_row = np.zeros((1, rbar_p.shape[1]), dtype=np.float32)
+        rhat = (rbar_p_row - gbar[None, :]) + pred_modeled   # (n, L)
         tpos = int(np.nonzero(modeled_pos_full == gene_axis_pos[pert])[0][0])
         rhat[:, tpos] = -np.inf
         mean_cts = (src_raw[:, modeled_pos_full].toarray().astype(np.float64)
@@ -237,9 +308,9 @@ def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[s
         # var 轴 = 全轴 18533，X 必须同宽（旧桥 log1p_bridge_to_counts 同语义）
         counts_full = src_raw.toarray().astype(np.float32)
         counts_full[:, modeled_pos_full] = np.random.default_rng(
-            stable_seed(cfg.heldout_line, pert, cfg.seed + 7)).poisson(mean_cts).astype(np.float32)
+            stable_seed(ctx, pert, cfg.seed + 7)).poisson(mean_cts).astype(np.float32)
         obs_g = pd.DataFrame({'target_gene': [pert] * counts_full.shape[0],
-                              'context': [cfg.heldout_line] * counts_full.shape[0],
+                              'context': [ctx] * counts_full.shape[0],
                               'target': [pert] * counts_full.shape[0]})
         rows.append(sparse.csr_matrix(counts_full))
         obs_rows.append(obs_g)
@@ -318,10 +389,9 @@ def main() -> None:
     cfg = ConfigUtils.load(BenchConfig, description=__doc__,
                            extra_sections=('inference',))
     assert cfg.checkpoint_path and os.path.exists(cfg.checkpoint_path), 'checkpoint_path required'
-    # --out_dir 缺省 → <output_base_dir>/inference_<ts>（2026-09-29 定案：
-    # 与 ckpt/log 同口径——yaml 给基目录、代码拼 ts）
-    if not cfg.out_dir:
-        cfg.out_dir = cfg.make_path('inference')
+    # 输出目录固定 yaml 派生（2026-09-29 定案）：<output_base_dir>/inference_<ts>，
+    # 不接受 --out_dir；复跑锚定同目录用 SCDFM_RUN_TS=<ts>
+    cfg.out_dir = cfg.make_path('inference')
     os.makedirs(cfg.out_dir, exist_ok=True)
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -387,6 +457,8 @@ def main() -> None:
         want = set(cfg.perts.split(','))
         tg = real.obs['target_gene'].astype(str).to_numpy()
         keep = (tg == 'non-targeting') | np.isin(tg, list(want))
+        if cfg.context:  # 多 control 源（2026-09-30）：只保留该 context 的对照
+            keep &= (real.obs['context'].astype(str).to_numpy() == cfg.context)
         real = real[keep].copy()
 
     cache, mask_path, vocab_path = artifact_paths(cfg)
@@ -403,7 +475,8 @@ def main() -> None:
     vf.load_state_dict(ckpt['model_state_dict'])
     vf = vf.to(device).eval()
 
-    pred = build_pred(cfg, vf, gene_ids, vocab, modeled, real, device)
+    pred = build_pred(cfg, vf, gene_ids, vocab, modeled, real, device,
+                      context=cfg.context)
     if not cfg.parts_only:
         tag = f'_{cfg.pred_tag}' if cfg.pred_tag else ''
         pred_path = os.path.join(cfg.out_dir, f'pred{tag}.h5ad')
@@ -438,13 +511,13 @@ def free_mem_mib() -> dict[int, int]:
     return res
 
 
-def _load_done(out_dir: str) -> set[str]:
-    """扫描 .partial 全部基因级 part（含旧分片命名），解析已完成基因名集合。"""
+def _load_done(out_dir: str) -> set[tuple[str, str]]:
+    """扫描 .partial 全部基因级 part（含旧分片命名），解析已完成 (context, gene) 对。"""
     done = set()
     for p in glob.glob(os.path.join(out_dir, '.partial', '*_g*.h5ad')):
         try:
             a = ad.read_h5ad(p)
-            done.add(str(a.obs['target_gene'].iloc[0]))
+            done.add((str(a.obs['context'].iloc[0]), str(a.obs['target_gene'].iloc[0])))
         except Exception as e:
             print(f'[warn] 跳过坏 part {os.path.basename(p)}: {e}', flush=True)
     return done
@@ -516,8 +589,6 @@ def dispatch_main() -> None:
     ap.add_argument('--checkpoint_path', required=True)
     ap.add_argument('--train_set_paths', nargs='*', default=[],
                     help='训练语料文件列表（传给 worker 派生缓存/mask/vocab 键，须与训练时一致）')
-    ap.add_argument('--out_dir', default=None,
-                    help='推理输出目录（缺省=<output_base_dir>/inference_<ts>，yaml common 节）')
     ap.add_argument('--heldout_line', default=icfg.heldout_line)
     ap.add_argument('--gpus', type=int, default=icfg.gpus)
     ap.add_argument('--ode_steps', type=int, default=icfg.ode_steps)
@@ -531,10 +602,13 @@ def dispatch_main() -> None:
 
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     os.chdir(root)
-    # --out_dir 缺省 → <output_base_dir>/inference_<ts>（2026-09-29 定案）
-    if not args.out_dir:
-        args.out_dir = icfg.make_path('inference')
-    out_dir = os.path.abspath(args.out_dir)
+    # 输出目录固定 yaml 派生（2026-09-29 定案）：<output_base_dir>/inference_<ts>，无 --out_dir；
+    # ts 用 SCDFM_RUN_TS 锚定（复跑同目录），未设则实时生成并写入环境传给 worker
+    ts = os.environ.get('SCDFM_RUN_TS') or time.strftime('%Y-%m-%d_%H-%M')
+    os.environ['SCDFM_RUN_TS'] = ts
+    out_dir = os.path.abspath(icfg.make_path('inference'))
+    # 2026-09-29 修复：out_dir 由 yaml 派生（原 --out_dir 由调用方预建），dispatch 需自建
+    os.makedirs(out_dir, exist_ok=True)
 
     # 已完成：合并产物存在即全部结束（resume 安全）
     merged_path = os.path.join(out_dir, 'predictions.h5ad')
@@ -573,13 +647,32 @@ def dispatch_main() -> None:
     sys.stderr = dlog
     print(f'[dispatch:{HOST}] self-log: {dlog_path}', flush=True)
 
-    with open(os.path.join(out_dir, 'perts.txt')) as f:
-        all_genes = [l.strip() for l in f if l.strip()]
+    # real.h5ad 由 dispatcher 一次性构建（2026-09-29 定案：仅对照——worker ODE 源
+    # 只需要对照、扰动基因名由 --perts flag 驱动；完整版真实扰动参考由 benchmark.sh
+    # 构建）。若 worker 各自并发 build_real 写同一文件会触发 HDF5 锁冲突 BlockingIOError。
+    real_path = os.path.join(out_dir, 'real.h5ad')
+    if not os.path.exists(real_path):
+        print(f'[dispatch:{HOST}] 构建 real.h5ad（仅对照 {icfg.n_ctrl_cells}）...',
+              flush=True)
+        real = build_real(icfg, include_perts=False)
+        real.write_h5ad(real_path)
+        print(f'[dispatch:{HOST}] real.h5ad: {real.shape[0]} cells', flush=True)
+    else:
+        real = sc.read_h5ad(real_path)
+
+    # 扰动基因名单 = yaml common.panel_csv_path（2026-09-29 用户定案：推理范围
+    # 由配置唯一决定，取代 out_dir/perts.txt——旧 prep 步骤不再必需）
+    panel_raw = pd.read_csv(icfg.panel_csv_path, header=None)[0].astype(str).tolist()
+    all_genes = [g for g in panel_raw if g != 'target_gene']
+    # 多 control 源（2026-09-30 用户定案）：任务粒度 = (context, gene)；
+    # contexts 从已建 real 的 obs.context 派生（数据自带，不猜）
+    contexts = sorted(set(real.obs['context'].astype(str)))
+    all_tasks = [(c, g) for c in contexts for g in all_genes]
     done = _load_done(out_dir)
     held = _claimed_genes(out_dir)
-    queue = [g for g in all_genes if g not in done and g not in held]
+    queue = [t for t in all_tasks if t not in done and f'{t[0]}__{t[1]}' not in held]
     print(f'[dispatch:{HOST}] {len(queue)} 待推理 / {len(done)} 已完成 / '
-          f'{len(held)} 他机认领中（共 {len(all_genes)}）', flush=True)
+          f'{len(held)} 他机认领中（共 {len(all_tasks)}，contexts={contexts}）', flush=True)
 
     map_path = os.path.join(out_dir, f'dispatch_map_{HOST}.txt')
     task_next = 0
@@ -588,17 +681,17 @@ def dispatch_main() -> None:
             task_next = sum(1 for _ in f)
     map_f = open(map_path, 'a')
 
-    procs: dict[int, tuple[int, str, subprocess.Popen]] = {}  # gpu -> (task, gene, proc)
+    procs: dict[int, tuple[int, str, str, subprocess.Popen]] = {}  # gpu -> (task, ctx, gene, proc)
     retry: dict[str, int] = {}
     gave_up: list[str] = []
 
-    def spawn(g: int, gene: str) -> None:
+    def spawn(g: int, ctx: str, gene: str) -> None:
         nonlocal task_next
         task = task_next
         task_next += 1
-        map_f.write(f'{task}\t{gene}\n')
+        map_f.write(f'{task}\t{ctx}\t{gene}\n')
         map_f.flush()
-        log = os.path.join(log_dir, f'{HOST}_g{g:02d}_t{task:03d}_{gene}.log')
+        log = os.path.join(log_dir, f'{HOST}_g{g:02d}_t{task:03d}_{ctx}_{gene}.log')
         cmd = [
             os.path.join(root, '.venv/bin/python'), '-m',
             'src.script.inference',
@@ -606,7 +699,7 @@ def dispatch_main() -> None:
             '--checkpoint_path', args.checkpoint_path,
             *(['--train_set_paths', *args.train_set_paths] if args.train_set_paths else []),
             '--heldout_line', args.heldout_line,
-            '--out_dir', out_dir,
+            '--context', ctx,
             '--no_eval', '--reuse_real',
             '--batch_size', str(args.batch_size),
             '--ode_steps', str(args.ode_steps),
@@ -622,35 +715,35 @@ def dispatch_main() -> None:
                                 stderr=subprocess.STDOUT,
                                 start_new_session=True)  # 脱离 dispatcher 进程组：
         # dispatcher/tmux 被杀不连坐 worker，在飞基因跑完照常落盘
-        procs[g] = (task, gene, proc)
-        print(f'[dispatch:{HOST}] gpu{g} <- t{task} {gene} '
+        procs[g] = (task, ctx, gene, proc)
+        print(f'[dispatch:{HOST}] gpu{g} <- t{task} {ctx}:{gene} '
               f'({time.strftime("%H:%M:%S")})', flush=True)
 
     while queue or procs:
         free = free_mem_mib()
         # 收割已退出 worker
-        for g, (task, gene, proc) in list(procs.items()):
+        for g, (task, ctx, gene, proc) in list(procs.items()):
             if proc.poll() is not None:
                 part = os.path.join(out_dir, '.partial',
                                     f'pred_shard_disp_{HOST}_{task}_g000.h5ad')
                 ok = os.path.exists(part)
                 del procs[g]
                 if ok:
-                    _release_claim(out_dir, gene)
-                    done.add(gene)
-                    print(f'[dispatch:{HOST}] gpu{g} t{task} {gene} 完成 '
+                    _release_claim(out_dir, f'{ctx}__{gene}')
+                    done.add((ctx, gene))
+                    print(f'[dispatch:{HOST}] gpu{g} t{task} {ctx}:{gene} 完成 '
                           f'({len(done)}/{len(done) + len(queue)})', flush=True)
                 else:
-                    _release_claim(out_dir, gene)
-                    retry[gene] = retry.get(gene, 0) + 1
-                    if retry[gene] > args.max_retry:
-                        gave_up.append(gene)
-                        print(f'[ERROR] {gene} 失败 {retry[gene]} 次，放弃 '
-                              f'（日志 logs/dispatch/{HOST}_g{g:02d}_t{task:03d}_{gene}.log）',
+                    _release_claim(out_dir, f'{ctx}__{gene}')
+                    retry[f'{ctx}__{gene}'] = retry.get(f'{ctx}__{gene}', 0) + 1
+                    if retry[f'{ctx}__{gene}'] > args.max_retry:
+                        gave_up.append(f'{ctx}__{gene}')
+                        print(f'[ERROR] {ctx}:{gene} 失败 {retry[f"{ctx}__{gene}"]} 次，放弃 '
+                              f'（日志 logs/dispatch/{HOST}_g{g:02d}_t{task:03d}_{ctx}_{gene}.log）',
                               flush=True)
                     else:
-                        queue.append(gene)
-                        print(f'[retry:{HOST}] {gene} 失败（第 {retry[gene]} 次），重新入队',
+                        queue.append((ctx, gene))
+                        print(f'[retry:{HOST}] {ctx}:{gene} 失败（第 {retry[f"{ctx}__{gene}"]} 次），重新入队',
                               flush=True)
         # 空闲（可用 > 门控）且无我方进程的卡领任务（跨机 O_EXCL 认领）
         for g in range(args.gpus):
@@ -658,10 +751,10 @@ def dispatch_main() -> None:
                 continue
             if free.get(g, 0) > args.free_mb:
                 for i in range(len(queue)):
-                    gene = queue[i]
-                    if _claim_gene(out_dir, gene):
+                    ctx, gene = queue[i]
+                    if _claim_gene(out_dir, f'{ctx}__{gene}'):
                         del queue[i]
-                        spawn(g, gene)
+                        spawn(g, ctx, gene)
                         break
         time.sleep(args.poll_s + random.uniform(0, 2.0))  # 跨机错峰：NFS O_EXCL
         # 在极窄竞争窗下偶发双认领（2026-09-24 实测 ACIN1），加随机抖动把两机
@@ -682,9 +775,9 @@ def dispatch_main() -> None:
     except FileExistsError:
         print(f'[dispatch:{HOST}] 最终合并由他机负责，本机退出', flush=True)
         sys.exit(0)
-    while len(_load_done(out_dir)) < len(all_genes) - len(gave_up):
+    while len(_load_done(out_dir)) < len(all_tasks) - len(gave_up):
         print(f'[dispatch:{HOST}] 等待他机收尾：{len(_load_done(out_dir))}/'
-              f'{len(all_genes) - len(gave_up)}', flush=True)
+              f'{len(all_tasks) - len(gave_up)}', flush=True)
         time.sleep(120)
     print(f'[dispatch:{HOST}] 全部基因完成，合并 .partial -> predictions.h5ad', flush=True)
     part_paths = sorted(glob.glob(os.path.join(out_dir, '.partial', '*_g*.h5ad')))
