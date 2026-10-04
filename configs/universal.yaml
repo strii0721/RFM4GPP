@@ -6,15 +6,28 @@
 common:
   # 训练语料文件列表：分散在多个文件夹的多个文件，建缓存时按序读入并沿 obs 拼接
   # （var 轴须逐文件一致）。缓存/mask/vocab 派生键含各文件名。
-  # 2026-09-28 起：VCC 测试集基因轴强行对齐的语料（18,533 基因轴，只读不改；
-  # target_gene/context 由 perturbation/is_control/cell_line_name 派生）。
-  # 4 文件全列出；扰动方向筛选由下方 common.perturb_direction 在代码中执行
-  # （K562 两文件为纯 CRISPRa，当前被白名单剔除，实际训练= Nadig 两文件 39 万细胞）。
+  # 2026-09-30 起：mrn19843 构建产物（17 原始数据集的 19,843 基因轴并集，
+  # target_gene/context 已由构建方派生好；轴=19,843 symbol）。
+  # 17 文件全列出（2026-09-30 用户定案：replogle_rpe1 也作训练集）；
+  # 扰动方向筛选由下方 common.perturb_direction 在代码中执行。
   train_set_paths:
-    - /ssd3/PubData/gene_alignment/Replogle_K562_gwps/Replogle_K562_gwps.h5ad
-    - /ssd3/PubData/gene_alignment/Replogle_K562_essential/Replogle_K562_essential.h5ad
-    - /ssd3/PubData/gene_alignment/Nadig_Jurkat/Nadig_Jurkat.h5ad
-    - /ssd3/PubData/gene_alignment/Nadig_HepG2/Nadig_HepG2.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d1_rest.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d1_stim8hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d1_stim48hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d2_rest.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d2_stim8hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d2_stim48hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d3_rest.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d3_stim8hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d3_stim48hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d4_rest.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d4_stim8hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d4_stim48hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/nadig_hepg2.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/nadig_jurkat.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/replogle_k562_essential.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/replogle_k562_gwps.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/replogle_rpe1.h5ad
   # 扰动方向白名单（2026-09-28 用户定案）：训练侧只保留 exo_perturb_subtype 值
   # 在此列表内的细胞。当前 [CRISPRi]=只留敲低（K562 CRISPRa 细胞全部剔除）；
   # 空列表=不过滤。panel 覆盖实测：Nadig 两文件并集对 282 panel ≥20 细胞 282/282。
@@ -33,28 +46,37 @@ common:
   output_base_dir: output
   # 日志基目录（2026-09-29 定案：train/build_tensors/inference 三入口共用）
   log_base_dir: logs
-  # real/pred 细胞数口径（2026-09-28 从 inference 节提取到 common：build_tensors
-  # real 侧三件套与 inference 共用；官方 context=18400 取子集控时长）
-  n_ctrl_cells: 4000        # real 侧对照细胞数（ODE 源 / DE 参考组）
-  n_pred_cells: 100         # 每扰动预测细胞数（2026-09-28 定案：RPE1 天然数据口径 100）
-  n_real_cells: 100         # real 侧每扰动参考细胞数上限（不足用全部真实细胞）
-  min_real_cells: 20        # real 侧每扰动最少细胞数（低于则跳过该基因）
+  # real/pred 细胞数口径（2026-09-30 按 VCC 官方规格修正）：
+  n_ctrl_cells: 18400       # real 侧对照细胞数=官方每 context 对照全量（val manifest control_cells=18400）
+  n_pred_cells: 400         # 每扰动预测细胞数=官方提交强制（vcc prep EXPECTED_CELLS_PER_PERT=400）
+  n_real_cells: 2000        # real 侧每扰动参考细胞数上限；官方评分不截断真实参考（官方 replogle 每基因 ≤1924，2000 等效全量）
+  min_real_cells: 100       # real 侧每扰动最少细胞数；官方真实数据每基因 ≥101（实测 min），100 保留全 300 基因
   # 测试集（留系真实侧，独立文件；whole 口径专用）
   test_set_paths: /ssd3/PubData/gene_alignment/Replogle_RPE1/Replogle_RPE1.h5ad
-  # VCC-2026 panel 清单 CSV（bad_aligned 282 基因；竞赛固定，与训练语料无关）
-  panel_csv_path: /home/ict2/Projects/vcc-2026/resources/datasets/bad_aligned_replogle/pert_counts.csv
+  # 推理 control 来源（2026-09-30 用户定案）：多个数据集，各取 target_gene ==
+  # 'non-targeting' 的细胞作推理 control（ODE 源），保留各文件原生 context 标签
+  # （官方 A/B/C 语义）；空列表=退回 test_set_paths 单文件口径。
+  inference_control_paths:
+    - /home/ict2/Projects/vcc-2026/resources/datasets/controls/context_A.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/controls/context_B.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/controls/context_C.h5ad
+  cache_workers: 14        # 缓存流式构建并行 worker 数（文件级并行，≤入训文件数）
+  # VCC-2026 panel 清单 CSV（2026-09-30 用户定案：mrn19843/pert_counts.csv，300 基因，
+  # 全部在 19,843 轴内；与训练语料无关）
+  panel_csv_path: /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/pert_counts.csv
   # 残差目标冻结张量目录（rbar_c/rbar_p/gbar/res_<line>.npy/combos.csv）
-  # 2026-09-28 起：bad_aligned_replogle 282 panel 专用目录（旧 11,919 轴张量保留在 output/residual_targets）
-  frozen_tensors_dir: /home/ict2/Projects/scDFM/output/frozen_tensors_bad_aligned_18533_replogle
+  # 2026-09-30 起：19,843 轴（mrn19843 语料）专用目录
+  frozen_tensors_dir: /home/ict2/Projects/scDFM/output/frozen_tensors_mrn19843
   # 训练缓存目录（processed_*.h5ad/.meta 与派生文件；2026-09-28 定案）
-  train_cache_dir: cache/train_cache_bad_aligned_18533
+  # 2026-09-30：cache 软链 → /ssd4/PubData/ict2/cache（实盘迁移，逻辑路径不变）
+  train_cache_dir: /home/ict2/Projects/scDFM/cache/train_cache_mrn19843
 
 # 训练参数（仅 FlowConfig 本身套用；GenConfig/BenchConfig/ScanConfig 子类不套用，
 # 它们的运行态字段走各自 schema 默认 + CLI）
 flow:
   model_type: origin
   batch_size: 96            # 论文全局 batch=96；8 卡 DDP 时 train.py 按 batch_total/gpus 分摊每 rank
-  ntoken: 18537             # 18,533 全轴基因（VCC 测试集对齐轴）+ 4 specials
+  ntoken: 19847             # 19,843 全轴基因（mrn19843 语料轴）+ 4 specials
   d_model: 512
   lr: 5.0e-5
   steps: 10000              # 2026-09-26 定案：残差范式 ~10k 收敛；--steps 可覆盖
@@ -70,8 +92,8 @@ flow:
   mode: predict_y
   perturbation_fusion_method: sum
   fusion_method: differential_perceiver
-  infer_top_gene: 18533
-  n_top_genes: 18533        # 2026-09-28：18,533 对齐轴全轴（缓存列=全轴，恒等对齐）
+  infer_top_gene: 19843
+  n_top_genes: 19843        # 2026-09-30：19,843 对齐轴全轴（mrn19843 语料轴，恒等对齐）
   checkpoint_path: ''
   gamma: 0.5                # 论文 MMD λ=0.5（残差范式 use_mmd_loss=false 未启用）
   split_method: whole       # replogle 留系：train 全量训练，测试语料=独立 RPE1 文件
@@ -80,7 +102,9 @@ flow:
   use_negative_edge: true   # 论文 kNN k=30 带符号相关（signed mask）
   topk: 30
   data_path: /home/ict2/Projects/scDFM/tmp
-  batch_total: 16             # 2026-09-28 实测：B=1/卡≈32GB → B=2/卡估算 ~64GB < 80GB 安全
+  batch_total: 16             # 2026-10-03：B=2/卡（旧轮验证口径 160k 样本 ~3.3h）。
+                              # 实测 B=1→8 吞吐只 +9%（L=19,843 flash 注意力带宽受限），
+                              # B=8 墙钟 7.3× 不划算；lr=5e-05 为该 batch 的验证值
   gpus: 8                     # torchrun --nproc_per_node 须与此一致；train.py 据此算每 rank batch
   train_pool_path: ''
   line_col: context         # replogle train 文件 context=K562/Jurkat/HepG2
@@ -106,7 +130,8 @@ flow:
 inference:
   heldout_line: RPE1        # 留出系（测试集独立文件时仅作标签名）
   ode_steps: 100            # ODE 积分步数（2026-09-26 新残差范式定案 100 步）
-  batch_size: 5             # worker 每基因推理 batch（B=5 单基因峰值 ~73GB，勿调大）
+  batch_size: 128           # worker 每基因推理 batch（2026-10-04 用户定案：B=40 实测 24GB，
+                            # 线性外推 B=128 ~77GB 贴 80GB 上限；若 OOM 降回 96-112）
   gpus: 8                   # dispatch 轮询的卡数（可用 < free_mb 的卡自动跳过）
   free_mb: 51200            # 空闲显存门控（MiB）
   poll_s: 10.0              # 轮询周期（秒）

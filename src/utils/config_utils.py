@@ -29,6 +29,8 @@ class CommonConfig:
     """公共路径配置（无默认值；全部从 universal.yaml common 节读入）。"""
     train_set_paths: list[str]
     test_set_paths: str
+    inference_control_paths: list[str]  # 推理 control 多源（2026-09-30 用户定案）
+    cache_workers: int   # 缓存流式构建的并行 worker 数（2026-09-30：文件级并行，≤文件数）
     panel_csv_path: str
     frozen_tensors_dir: str
     train_cache_dir: str
@@ -110,6 +112,8 @@ class FlowConfig:
     train_set_paths: list[str]
     panel_csv_path: str          # VCC-2026 官方 300 panel 清单（竞赛固定，与训练语料无关）
     test_set_paths: str    # 竞赛留系真实侧（RPE1），benchmark 专用
+    inference_control_paths: list[str]  # 推理 control 多源（2026-09-30 用户定案；common 节）
+    cache_workers: int   # 缓存流式构建并行 worker 数（2026-09-30；common 节）
     train_pool_path: str     # 训练每步采样池（非空=基因清单；空串=整个基因轴，含 panel，2026-09-21 定案）
     line_col: str            # replogle train 文件 context=K562/Jurkat/HepG2（obs 无 cell_line 列）
     max_len: int
@@ -232,11 +236,15 @@ class ConfigUtils:
         else:
             parsed = tyro.cli(cli_cls)
         argv = sys.argv[1:]
+        # 归一化连字符（--reuse_real 与 --reuse-real 等价；2026-09-29 修复：
+        # spawn 传下划线形式时门控不匹配 → bool flag 静默失效，worker 不复用
+        # real.h5ad、各自并发写同一文件触发 HDF5 锁冲突）
+        argv_norm = [a.replace('_', '-') for a in argv if a.startswith('--')]
         for f in dataclasses.fields(config_cls):
             v = getattr(parsed, f.name)
             if f.name in bool_names:
                 hyphen = f.name.replace('_', '-')
-                if f'--{hyphen}' in argv or f'--no-{hyphen}' in argv:
+                if f'--{hyphen}' in argv_norm or f'--no-{hyphen}' in argv_norm:
                     setattr(cfg, f.name, v)
             elif v is not None:
                 setattr(cfg, f.name, v)
