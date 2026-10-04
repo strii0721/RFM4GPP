@@ -19,6 +19,154 @@ from src.utils.utils import build_gene_coexpression_graph,sorted_pad_mask, deriv
 # combosciplex url: https://figshare.com/articles/dataset/combosciplex/25062230?file=44229635
 # 'norman' url = 'https://dataverse.harvard.edu/api/access/datafile/6154020'
 
+import multiprocessing as mp
+import h5py
+
+
+def _corpus_stem(cfg):
+    """缓存键语料 stem：各文件名（去扩展名）排序拼接；超长时 sha1 缩短
+    （文件系统文件名 255B 上限，2026-09-30 实测 17 文件拼接超限）。"""
+    stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
+                    for p in sorted(cfg.train_set_paths))
+    if len(stem) > 80:
+        import hashlib
+        stem = 'h' + hashlib.sha1(stem.encode()).hexdigest()[:24]
+    return stem
+
+
+def _read_indptr(path):
+    """backed 模式下 X 是 h5sparse._CSRDataset（无 .indptr 属性）；
+    h5py 直接读 X group 的 indptr dataset（MB 级）。"""
+    with h5py.File(path, 'r') as f:
+        return np.asarray(f['X']['indptr'][::]).astype(np.int64)
+
+
+def _scan_cache_file(path, cfg):
+    """缓存流式构建第一遍（2026-09-30）：backed 只读 obs + X.indptr，
+    行过滤（perturb_direction）→ keep 掩码与 nnz 统计。"""
+    a = sc.read_h5ad(path, backed='r')
+    obs = derive_pert_columns(a.obs, cfg.obs_col_candidates, cfg.ctrl_sentinels)
+    keep = np.ones(a.n_obs, dtype=bool)
+    if cfg.perturb_direction and 'exo_perturb_subtype' in obs:
+        keep = obs['exo_perturb_subtype'].astype(str).isin(cfg.perturb_direction).to_numpy()
+    indptr = _read_indptr(path)                     # 行指针（MB 级）
+    nnz_per_row = np.diff(indptr)
+    keep_nnz = nnz_per_row[keep]
+    var_names = list(a.var_names.astype(str))
+    a.file.close()
+    return keep, int(keep.sum()), keep_nnz, var_names
+
+
+def _process_cache_file(args):
+    """缓存流式构建第二遍（2026-09-30）：backed 行块读 → 行过滤 → CP10k+log1p
+    → float32 写入 memmap 预分区段；obs 分片写 parquet；返回列和（零列验证）。"""
+    (path, cfg, row_off, nnz_off, keep, data_f, idx_f, ptr_f,
+     obs_parquet, block_rows) = args
+    # np.load(mmap_mode='r+') 正确读 header 并映射数据区；np.memmap(mode='r+')
+    # 会从 offset 0 映射、写入时覆盖 npy header（实测踩坑，2026-09-30）
+    d_mm = np.load(data_f, mmap_mode='r+')
+    i_mm = np.load(idx_f, mmap_mode='r+')
+    p_mm = np.load(ptr_f, mmap_mode='r+')
+    a = sc.read_h5ad(path, backed='r')
+    n = a.n_obs
+    # obs 分片（derive + 方向过滤 + 派生列）落盘，主进程合并
+    obs = derive_pert_columns(a.obs, cfg.obs_col_candidates, cfg.ctrl_sentinels)
+    obs_kept = obs.iloc[np.nonzero(keep)[0]].copy()
+    tg = obs_kept['target_gene'].astype(str).to_numpy()
+    obs_kept['condition'] = np.where(tg == 'non-targeting', 'control', tg + '+control')
+    obs_kept['is_control'] = (tg == 'non-targeting')
+    obs_kept.to_pickle(obs_parquet)      # pickle 分片（无 pyarrow 依赖）
+    del obs_kept, obs
+    # 行指针段（int64：总 nnz 1.1e11 超 int32；旧轮同口径）
+    indptr = _read_indptr(path)
+    seg_ptr = np.concatenate([[0], np.cumsum(np.diff(indptr)[keep])])
+    p_mm[row_off:row_off + len(seg_ptr)] = seg_ptr + nnz_off
+    col_sums = np.zeros(a.n_vars, dtype=np.float64)
+    w = nnz_off
+    for lo in range(0, n, block_rows):
+        hi = min(lo + block_rows, n)
+        blk = a[lo:hi]
+        k = keep[lo:hi]
+        Xb = blk.X.tocsr().astype(np.float32)
+        del blk
+        if not k.all():
+            Xb = Xb[k]
+        rowsum = np.asarray(Xb.sum(axis=1)).ravel()
+        scale = np.divide(1e4, rowsum, out=np.zeros_like(rowsum, dtype=np.float64),
+                          where=rowsum > 0)      # 零行保持 0（与 sc.pp.normalize_total 一致）
+        Xb.data = np.log1p(Xb.data * np.repeat(scale, np.diff(Xb.indptr))).astype(np.float32)
+        m = Xb.nnz
+        d_mm[w:w + m] = Xb.data
+        i_mm[w:w + m] = Xb.indices.astype(np.int32)
+        w += m
+        col_sums += np.asarray(Xb.sum(axis=0)).ravel()
+        del Xb
+    a.file.close()
+    return col_sums
+
+
+def _streaming_build_cache(cfg, cache, paths):
+    """缓存流式并行构建（2026-09-30 用户定案）：两遍扫描，峰值内存=单文件行块级。
+    产物 = X 侧车三件套（直接以最终文件名创建 memmap，免搬移）+ meta.h5ad。"""
+    import time as _t
+    t0 = _t.time()
+    nw = min(cfg.cache_workers, len(paths))
+    print(f'##### vcc: streaming cache build start: {len(paths)} files, '
+          f'{nw} workers #####', flush=True)
+    ctx = mp.get_context('fork')
+    # 第一遍：并行扫描（行过滤 + nnz 统计）
+    with ctx.Pool(nw) as pool:
+        scans = pool.starmap(_scan_cache_file, [(p, cfg) for p in paths])
+    keeps = [s[0] for s in scans]
+    n_kepts = [s[1] for s in scans]
+    nnz_rows = [s[2] for s in scans]
+    var0 = scans[0][3]
+    for i, s in enumerate(scans[1:], start=1):
+        assert s[3] == var0, f'var 轴不一致: {paths[i]}'
+    N = sum(n_kepts)
+    T = sum(int(r.sum()) for r in nnz_rows)
+    print(f'##### vcc: scan done: {N} cells kept, {T} nnz, '
+          f'{_t.time() - t0:.0f}s #####', flush=True)
+    # 预分配 memmap（直接以 sidecar 最终文件名创建；indptr int64：nnz 超 int32）
+    cfg._stream_total_nnz = T
+    cfg._stream_n_obs = N
+    data_f, idx_f, ptr_f = cache + '.data.npy', cache + '.indices.npy', cache + '.indptr.npy'
+    _hold = []  # 持有引用防 GC 竞态：header 必须显式 flush 落盘后 worker 才可 r+ 打开
+    for fn, dt, shape in ((data_f, np.float32, (T,)), (idx_f, np.int32, (T,)),
+                          (ptr_f, np.int64, (N + 1,))):
+        mm = np.lib.format.open_memmap(fn, dtype=dt, mode='w+', shape=shape)
+        mm.flush()
+        _hold.append(mm)
+    # 第二遍：并行处理（写各自预分区段）
+    obs_dir = cache + '.obs_parts'
+    os.makedirs(obs_dir, exist_ok=True)
+    row_off, nnz_off = 0, 0
+    tasks = []
+    for i, p in enumerate(paths):
+        if n_kepts[i] == 0:      # 该文件被方向白名单整滤（如 CRISPRa 文件）
+            continue
+        tasks.append((p, cfg, row_off, nnz_off, keeps[i], data_f, idx_f, ptr_f,
+                      os.path.join(obs_dir, f'obs_{i:02d}.pkl'), 100_000))
+        row_off += n_kepts[i]
+        nnz_off += int(nnz_rows[i].sum())
+    with ctx.Pool(nw) as pool:
+        col_sums = pool.map(_process_cache_file, tasks)
+    zero_cols = int((sum(col_sums) == 0).sum())
+    print(f'##### vcc: process done: zero-variance cols={zero_cols}, '
+          f'{_t.time() - t0:.0f}s #####', flush=True)
+    # meta.h5ad（obs 分片 concat + var 全轴；X=None）
+    obs_all = pd.concat([pd.read_pickle(os.path.join(obs_dir, f'obs_{i:02d}.pkl'))
+                         for i in range(len(paths))
+                         if os.path.exists(os.path.join(obs_dir, f'obs_{i:02d}.pkl'))],
+                        ignore_index=True)
+    if hasattr(ad.settings, 'allow_write_nullable_strings'):
+        ad.settings.allow_write_nullable_strings = True
+    sc.AnnData(X=None, obs=obs_all,
+               var=pd.DataFrame(index=var0)).write(cache + '.meta.h5ad')
+    print(f'##### vcc: streaming cache built: {N} x {len(var0)}, '
+          f'{T} nnz, meta+sidecars saved, {_t.time() - t0:.0f}s total #####', flush=True)
+
+
 class Data:
     def __init__(self, data_path='../../data', config=None):
         self.data_path = data_path
@@ -27,6 +175,22 @@ class Data:
         os.makedirs(data_path, exist_ok=True)
 
         
+    def _attach_sidecar(self, cache: str) -> None:
+        """X 侧车三件套零拷贝挂接（2026-09-21 定案，2026-09-30 抽为公共方法）：
+        读 meta + memmap 映射，空构造 CSR 属性直赋（避免 COO→CSR 全量拷贝）。
+        has_sorted_indices/canonical 直接置真（侧车源自规范 CSR 写出，经逐位验证）。"""
+        self.adata = sc.read_h5ad(cache + '.meta.h5ad')
+        d = np.load(cache + '.data.npy', mmap_mode='r')
+        idx = np.load(cache + '.indices.npy', mmap_mode='r')
+        ptr = np.load(cache + '.indptr.npy', mmap_mode='r')
+        X = sparse.csr_matrix(self.adata.shape, dtype=d.dtype)
+        X.data = d
+        X.indices = idx
+        X.indptr = ptr
+        X.has_sorted_indices = True
+        X.has_canonical_format = True
+        self.adata.X = X
+
     def load_data(self, data_name = None, data_path = None):
         self.data_name = data_name
         if data_name in ['norman', 'norman_umi_go_filtered',]:
@@ -41,13 +205,14 @@ class Data:
                          if self.config.train_pool_path else 'all')
             # 多文件语料（2026-09-27）：缓存键 stem = 各文件名（去扩展名）排序后 + 拼接，
             # 与 generate_submission.corpus_stem / process_data 的派生规则一致
-            corpus_stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
-                                   for p in sorted(self.config.train_set_paths))
+            corpus_stem = _corpus_stem(self.config)
             cache = os.path.join(self.config.train_cache_dir,
                                  f'processed_n{self.config.n_top_genes}_'
                                  f'{corpus_stem}'
                                  f'_{pool_stem}.h5ad')
-            if os.path.exists(cache):
+            # 2026-09-30 方案 A：缓存不再落大 h5ad 本体，就绪判据 = X 侧车
+            # （processed_*.h5ad.data.npy）；旧格式（大 h5ad 存在）仍兼容读取。
+            if os.path.exists(cache) or os.path.exists(cache + '.data.npy'):
                 self._loaded_from_cache = True
                 # 共享内存加载（2026-09-21）：X 侧车 .npy 存在时直接读 meta（MB 级）
                 # + memmap 零拷贝映射，**跳过整 h5ad 读取**（曾每 rank 白读 59GB、
@@ -57,48 +222,19 @@ class Data:
                 # 版本基本免疫 OOM killer。
                 sidecar = cache + '.data.npy'
                 if os.path.exists(sidecar):
-                    self.adata = sc.read_h5ad(cache + '.meta.h5ad')
-                    d = np.load(cache + '.data.npy', mmap_mode='r')
-                    idx = np.load(cache + '.indices.npy', mmap_mode='r')
-                    ptr = np.load(cache + '.indptr.npy', mmap_mode='r')
-                    # 注意：csr_matrix((d,idx,ptr), copy=False) 仍走 COO→CSR 转换并
-                    # 无条件拷贝（实测 RSS 92GB）；零拷贝必须空构造 + 属性直赋。
-                    X = sparse.csr_matrix(self.adata.shape, dtype=d.dtype)
-                    X.data = d
-                    X.indices = idx
-                    X.indptr = ptr
-                    # 关键（2026-09-21 两次训练崩因）：属性直赋后 scipy 不缓存
-                    # canonical 状态，首次切片会触发 sum_duplicates 全量校验拷贝
-                    # （实测 38s + 92GB/进程；8 rank × 4 worker 并发 → cgroup
-                    # 768GB 限额秒爆，worker 被 OOM kill）。数组源自 anndata 写出
-                    # 的规范 csr（行内已排序、无重复，经逐位验证），直接置真。
-                    X.has_sorted_indices = True
-                    X.has_canonical_format = True
-                    self.adata.X = X
+                    self._attach_sidecar(cache)
                     print(f'##### load_data: X via shared memmap sidecars: {sidecar} #####')
                 else:
                     self.adata = sc.read_h5ad(cache)
                 print(f'##### load_data: cache hit, corpus read skipped: {cache} #####')
             else:
-                # 多文件语料（2026-09-27 用户定案）：按序全量读入、沿 obs 拼接。
-                # var 轴与 obs 列集合逐文件校验一致，不一致直接报错（缓存派生键已含各文件名）。
-                paths = list(self.config.train_set_paths)
-                assert paths, 'train_set_paths 为空'
-                parts = []
-                var0 = None
-                for p in paths:
-                    a = sc.read_h5ad(p)
-                    a.obs = derive_pert_columns(a.obs, self.config.obs_col_candidates,
-                                                self.config.ctrl_sentinels)
-                    if var0 is None:
-                        var0 = list(a.var_names)
-                    else:
-                        assert list(a.var_names) == var0, f'var 轴不一致: {p}'
-                    parts.append(a)
-                    print(f'##### load_data: corpus part {p}: {a.shape} #####')
-                self.adata = ad.concat(parts, join='outer', index_unique=None)
-                print(f'##### load_data: corpus concat {len(parts)} files -> {self.adata.shape} #####')
+                # 2026-09-30 流式（用户定案）：语料不再全量读入 concat
+                # （17 文件 int64 全载 ~1.3TB 必 OOM）；process_data 的缓存重建
+                # 分支以 backed 行块读流式并行构建（见 _streaming_build_cache）。
+                self.adata = None
                 self._loaded_from_cache = False
+                print(f'##### load_data: corpus to be streamed by process_data '
+                      f'(cache miss, {len(self.config.train_set_paths)} files) #####')
         else:
             raise ValueError(data_name + ' is not a valid data name')
         
@@ -287,85 +423,28 @@ class Data:
         elif self.data_name == 'vcc':
             cfg = self.config
             assert cfg is not None, 'vcc mode requires Data(config=...)'
-            corpus_stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
-                                   for p in sorted(cfg.train_set_paths))
+            corpus_stem = _corpus_stem(cfg)
             # 缓存键含采样池（2026-09-17：缓存列= train_pool_path 清单；换池须重建）
             pool_stem = (os.path.splitext(os.path.basename(str(cfg.train_pool_path)))[0]
                          if cfg.train_pool_path else 'all')
             cache = os.path.join(cfg.train_cache_dir,
                                  f'processed_n{n_top_genes}_{corpus_stem}_{pool_stem}.h5ad')
             os.makedirs(os.path.dirname(cache), exist_ok=True)
-            if os.path.exists(cache):
+            # 2026-09-30 方案 A：缓存就绪判据 = X 侧车（不落大 h5ad 本体）
+            if os.path.exists(cache) or os.path.exists(cache + '.data.npy'):
                 if getattr(self, '_loaded_from_cache', False):
                     print(f'##### processed h5ad already loaded from cache: {cache} #####')
                 else:
                     print(f'##### loading cached processed h5ad: {cache} #####')
                     self.adata = sc.read_h5ad(cache)
             else:
-                # 1) CRISPRi only (drop CRISPR KO)
-                if cfg.crispr_type_col and cfg.crispr_type_col in self.adata.obs:
-                    keep = self.adata.obs[cfg.crispr_type_col].astype(str) == cfg.crispr_type_value
-                    print(f'##### vcc: keeping {keep.sum()}/{self.adata.n_obs} {cfg.crispr_type_value} cells #####')
-                    self.adata = self.adata[keep].copy()
-                # 1b) 扰动方向白名单（common.perturb_direction，2026-09-28 定案）：
-                #     exo_perturb_subtype 值不在列表内的细胞剔除（空列表=不过滤）
-                if cfg.perturb_direction and 'exo_perturb_subtype' in self.adata.obs:
-                    keep = self.adata.obs['exo_perturb_subtype'].astype(str).isin(cfg.perturb_direction)
-                    print(f'##### vcc: keeping {keep.sum()}/{self.adata.n_obs} cells with '
-                          f'exo_perturb_subtype in {cfg.perturb_direction} #####')
-                    self.adata = self.adata[keep].copy()
-                # 2) condition / is_control from target_gene (single 'non-targeting' label)
-                tg = self.adata.obs['target_gene'].astype(str).to_numpy()
-                is_ctl = tg == 'non-targeting'
-                self.adata.obs['condition'] = np.where(is_ctl, 'control', tg + '+control')
-                self.adata.obs['is_control'] = is_ctl
-                # 3) 列过滤：train_pool_path 非空 = 清单（如 common_hvg）∩ 语料 var；
-                #    空串（2026-09-19 定案）= 整个基因轴，先全轴预处理、第 5 步 HVG
-                #    裁到 n_top_genes（11919 → 实质全部有 dispersion 的列）。
-                if cfg.train_pool_path:
-                    pool_raw = pd.read_csv(cfg.train_pool_path)['gene_name'].astype(str).tolist()
-                    keep_cols = [g for g in pool_raw if g in set(self.adata.var_names)]
-                    assert keep_cols, f'train_pool_path={cfg.train_pool_path!r} yields no usable genes'
-                    self.adata = self.adata[:, keep_cols].copy()
-                    print(f'##### vcc: cache columns filtered to {len(keep_cols)} genes '
-                          f'from {cfg.train_pool_path} #####')
-                else:
-                    print(f'##### vcc: full-axis cache (train_pool_path empty, '
-                          f'{self.adata.n_vars} genes before HVG) #####')
-                # 4) paper preprocessing: normalize_total(CP10k) -> log1p（过滤后矩阵，快）
-                #    (log-space linear paths, upstream combosciplex path)
-                sc.pp.normalize_total(self.adata, target_sum=1e4)
-                sc.pp.log1p(self.adata)
-                # 5) HVG：清单池时代 n_top=全部列只算 dispersions_norm（推理 ranking 用）
-                #    不裁列；全轴时代 n_top=n_top_genes（11919）实质保留全部有
-                #    dispersion 的列（零方差列 dispersion=NaN 永不入选）
-                sc.pp.highly_variable_genes(
-                    self.adata,
-                    n_top_genes=(self.adata.n_vars if cfg.train_pool_path else n_top_genes))
-                if not cfg.train_pool_path:
-                    hv = self.adata.var['highly_variable'].to_numpy()
-                    self.adata = self.adata[:, hv].copy()
-                    print(f'##### vcc: full-axis cache kept {int(hv.sum())}/{len(hv)} '
-                          f'genes (zero-variance dropped) #####')
-                # obs/_index from the merged corpus reads back as a pandas
-                # StringArray; anndata <0.13 refuses to write nullable strings
-                # unless opted in (0.13+ default-on, setting may be removed)
-                if hasattr(ad.settings, 'allow_write_nullable_strings'):
-                    ad.settings.allow_write_nullable_strings = True
-                # 缓存写出前把稀疏 X 的列索引 int64→int32：nnz 7.7e9 > 2^31 时
-                # scipy 默认 int64 索引（每 rank RAM ~92GB）；列号 < 2^31 恒成立
-                # （11,371 列），纯索引降精度、数值位不变，每 rank 降到 ~61GB。
-                if hasattr(self.adata.X, 'indices'):
-                    self.adata.X.indices = self.adata.X.indices.astype(np.int32, copy=False)
-                self.adata.write(cache)
-                # X 侧车（共享 memmap 加载用）：data/indices/indptr 三组 .npy + 无 X 的
-                # meta.h5ad（obs/var/uns）。load_data 检测到侧车即走零拷贝共享加载。
-                np.save(cache + '.data.npy', self.adata.X.data)
-                np.save(cache + '.indices.npy', self.adata.X.indices)
-                np.save(cache + '.indptr.npy', self.adata.X.indptr)
-                sc.AnnData(X=None, obs=self.adata.obs, var=self.adata.var,
-                           uns=self.adata.uns).write(cache + '.meta.h5ad')
-                print(f'##### vcc: processed cached to {cache} #####')
+                # 2026-09-30 流式并行重建（用户定案，取代原全量读入+sc.pp 预处理）：
+                # 两遍扫描 → memmap 侧车三件套 + meta.h5ad（行过滤/CP10k/log1p
+                # 在 worker 内完成；HVG 裁列跳过——n_top_genes==语料 var 全轴，
+                # 零方差列构建后统计打印）。构建后挂接 sidecar。
+                _streaming_build_cache(cfg, cache, list(cfg.train_set_paths))
+                self._attach_sidecar(cache)
+                self._loaded_from_cache = True
             # 5) split：默认 single_line（HCT116 留系，2026-09-14 取代五折）；
             #    'single' = 80/20 panel 基因留出 x5 折（原方案，fold 选折）。
             #    held-out 基因/系 cells + all control cells form the test set,
@@ -430,19 +509,37 @@ class Data:
                 # 测试语料 = 独立文件 config.test_set_paths，由
                 # benchmark_line_holdout.py 直接读取（do_eval 必须 False）。
                 # adata_test 给零行空壳，兼容 TestDataset 构造（不用其方法）。
+                print('##### vcc: split/whole step1: mode assign #####', flush=True)
                 self.adata.obs['mode'] = 'train'
-                self.adata.obs['Drug1'] = self.adata.obs['condition'].str.split('+').str[0]
-                self.adata.obs['Drug2'] = self.adata.obs['condition'].str.split('+').str[-1]
+                # 2026-10-03：Drug1/Drug2 由 target_gene 直接构造（condition 列
+                # 是 category dtype，.str.split 在 25M 行上实测卡死）。语义等价：
+                # condition = tg+'+control'（扰动行）/ 'control'（对照行）⇒
+                # split[0] = tg 或 'control'、split[-1] 恒 'control'。
+                print('##### vcc: split/whole step2a: tg astype #####', flush=True)
+                tg_arr = self.adata.obs['target_gene'].astype(str).to_numpy()
+                print('##### vcc: split/whole step2b: np.where #####', flush=True)
+                drug1 = np.where(tg_arr == 'non-targeting', 'control', tg_arr)
+                print('##### vcc: split/whole step2c: assign Drug1 #####', flush=True)
+                self.adata.obs['Drug1'] = drug1
+                print('##### vcc: split/whole step3: Drug2 #####', flush=True)
+                self.adata.obs['Drug2'] = 'control'
                 # 2026-09-17 内存优化：whole 无切片，直接共享引用（TrainSampler 只加
                 # obs 列、无 X 变异；copy() 会让每 rank 多持有一份 ~93GB 矩阵，8 rank 共爆内存）
                 self.adata_train = self.adata
-                self.adata_test = self.adata[0:0].copy()
+                # 2026-10-03：self.adata[0:0].copy() 在 25M 行 CSR 上触发 scipy
+                # 空切片灾难路径（faulthandler 实测卡死 data.py:529）；直接构造
+                # 零行空壳（TestDataset 仅需 obs/var 结构，whole 口径不使用其方法）。
+                self.adata_test = ad.AnnData(
+                    X=sparse.csr_matrix((0, self.adata.n_vars), dtype=np.float32),
+                    obs=self.adata.obs.iloc[0:0].copy(),
+                    var=self.adata.var.copy())
                 print(f'##### vcc: whole-corpus split: train {self.adata_train.n_obs} cells '
                       f'(no internal holdout; test file: {cfg.test_set_paths}) #####')
             else:
                 raise ValueError(f'vcc requires split_method="single"/"single_line"/"whole", '
                                  f'got {split_method!r}')
-            condition = np.unique(list(self.adata.obs['condition']))
+            # 2026-10-03：list(25M str) 会瞬时占 ~100GB；直接 numpy 化再 unique
+            condition = np.unique(self.adata.obs['condition'].astype(str).to_numpy())
             unique_perturbation = []
             np.array([unique_perturbation.extend(perturbation.split('+')) for perturbation in condition])
             unique_perturbation = np.unique(unique_perturbation)
@@ -461,12 +558,13 @@ class Data:
         if self.data_name == 'vcc' and cfg is not None:
             # per-corpus mask file (graph built from this corpus's own train data);
             # signed/unsigned graphs are different artifacts -> name must differ
-            _stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
-                             for p in sorted(cfg.train_set_paths))
+            _stem = _corpus_stem(cfg)   # 2026-10-03：17 文件 stem 拼接超文件名上限
             _pool = (os.path.splitext(os.path.basename(str(cfg.train_pool_path)))[0]
                      if cfg.train_pool_path else 'all')
             _neg = '_negative_edge' if use_negative_edge else ''
-            mask_path = os.path.join(self.data_path, self.data_name,
+            # 2026-10-03 用户定案：mask 与缓存同目录（train_cache_dir），
+            # 不再单独放 tmp/vcc
+            mask_path = os.path.join(cfg.train_cache_dir,
                                      f'mask_fold_{fold}topk_{k}{split_method}{_neg}_{_stem}_{_pool}.pt')
         elif use_negative_edge:
             mask_path = os.path.join(self.data_path, self.data_name,'mask_fold_'+str(fold)+'topk_'+str(k)+split_method+'_negative_edge'+'.pt')
@@ -477,9 +575,32 @@ class Data:
         else:
             if self.data_name == 'vcc' and cfg is not None and cfg.mask_subsample and self.adata_train.n_obs > cfg.mask_subsample:
                 rng = np.random.default_rng(42)
-                sub_idx = rng.choice(self.adata_train.n_obs, cfg.mask_subsample, replace=False)
-                X = self.adata_train.X[sub_idx].toarray()
-                print(f'##### vcc: mask built from {cfg.mask_subsample} subsampled train cells #####')
+                # 2026-10-03 终版二：50 个随机连续块（每块 1000 行）——单行随机
+                # gather 在 856GB memmap 上是 yrfs 随机读（50k 次 × ms 级延迟）；
+                # 连续块切片=顺序 IO（50 次 × 16MB），代表性跨 50 个位置。
+                rng = np.random.default_rng(42)
+                n_blk, blk_sz = 50, 1000
+                starts = np.sort(rng.choice(self.adata_train.n_obs - blk_sz,
+                                            n_blk, replace=False))
+                print(f'##### vcc: mask step1: gather {n_blk}x{blk_sz} rows #####', flush=True)
+                Xsrc = self.adata_train.X
+                parts_d, parts_i = [], []
+                seg = Xsrc.indptr
+                for s in starts:
+                    # 纯 numpy 段提取（不经过 scipy 行切片——实测 scipy
+                    # csr.__getitem__ 行切片在 25M 行 memmap CSR 上卡死）
+                    lo = int(seg[s])
+                    hi = int(seg[s + blk_sz])
+                    parts_d.append(Xsrc.data[lo:hi])
+                    parts_i.append(Xsrc.indices[lo:hi])
+                out_data = np.concatenate(parts_d)
+                out_idx = np.concatenate(parts_i)
+                row_nnz = np.concatenate([np.diff(seg[s:s + blk_sz + 1]) for s in starts])
+                out_ptr = np.concatenate([[0], np.cumsum(row_nnz)])
+                X = sparse.csr_matrix(
+                    (out_data, out_idx, out_ptr),
+                    shape=(n_blk * blk_sz, self.adata_train.n_vars)).toarray()
+                print(f'##### vcc: mask step2: toarray done {X.shape} #####', flush=True)
             else:
                 X = self.adata_train.X.toarray()
             mask = build_gene_coexpression_graph(X,
@@ -532,7 +653,11 @@ class TrainSampler:
         self.data_name = data_name
         self.adata = adata
         self.perturbation_covariates = perturbation_covariates
-        self.adata.obs['perturbation_covariates'] = self.adata.obs[perturbation_covariates].apply(lambda x: '+'.join(x), axis=1)
+        # 2026-10-03：apply(lambda, axis=1) 在 25M 行上实测卡死（纯 Python 逐行）；
+        # 向量化拼接（object 列 + 是 C 级逐元素）
+        self.adata.obs['perturbation_covariates'] = (
+            self.adata.obs[perturbation_covariates[0]].astype(str) + '+' +
+            self.adata.obs[perturbation_covariates[1]].astype(str))
         self._perturbation_covariates = adata.obs['perturbation_covariates'].unique()
         
         self._perturbation_covariates = self._perturbation_covariates[self._perturbation_covariates != 'control+control']
@@ -540,7 +665,7 @@ class TrainSampler:
         self._perturbation_covariates.sort()
         self.perturbation_covariates_dict = {perturbation: i for i, perturbation in enumerate(self._perturbation_covariates)}
         
-        perturbation_covariates_id = [adata.obs[perturbation_covariates[i]].apply(lambda x: perturbation_dict[x])
+        perturbation_covariates_id = [self.adata.obs[perturbation_covariates[i]].map(perturbation_dict)
                                     for i in range(len(perturbation_covariates))]
         self.perturbation_covariates_id = np.array(perturbation_covariates_id).T
         
@@ -656,7 +781,7 @@ class TestDataset:
         self._perturbation_covariates.sort()
         self.perturbation_covariates_dict = {perturbation: i for i, perturbation in enumerate(self._perturbation_covariates)}
         
-        perturbation_covariates_id = [adata.obs[perturbation_covariates[i]].apply(lambda x: perturbation_dict[x])
+        perturbation_covariates_id = [self.adata.obs[perturbation_covariates[i]].map(perturbation_dict)
                                     for i in range(len(perturbation_covariates))]
         self.perturbation_covariates_id = np.array(perturbation_covariates_id).T
         

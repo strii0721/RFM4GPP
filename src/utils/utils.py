@@ -103,6 +103,9 @@ def process_vocab(data_manager, config):
         # corpus never reuses another corpus's gene set
         stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
                         for p in sorted(config.train_set_paths))
+        if len(stem) > 80:  # 2026-10-03：17 文件拼接超文件名上限，sha1 缩短
+            import hashlib
+            stem = 'h' + hashlib.sha1(stem.encode()).hexdigest()[:24]
         pool_stem = (os.path.splitext(os.path.basename(str(config.train_pool_path)))[0]
                      if config.train_pool_path else 'all')
         vocab_fname = f'{config.data_name}_{config.n_top_genes}_{stem}_{pool_stem}_highly_vocab.json'

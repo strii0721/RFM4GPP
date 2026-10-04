@@ -15,10 +15,10 @@
   .venv/bin/python -m src.script.build_tensors          # 全默认（YAML 派生）
   .venv/bin/python -m src.script.build_tensors --adata_path <x.h5ad> --cache_meta <m.h5ad>
 
-产物（中间缓存文件非最终输出；列对齐训练缓存 11,371 基因序）：
+产物（2026-09-30 mrn19843 口径：语料轴=缓存列=19,843 基因）：
   combos.csv          (line, pert, row) —— row = res_<line>.npy 行号
-  res_<line>.npy      float32 (n_perts_line, 11371)
-  rbar_p.npy + rbar_p_perts.csv     跨系扰动主效应（8,678 扰动）
+  res_<line>.npy      float32 (n_perts_line, 19843)
+  rbar_p.npy + rbar_p_perts.csv     跨系扰动主效应
   rbar_c.npy + rbar_c_lines.csv     系主效应
   gbar.npy           全局均值
   genes_cache.csv    缓存列基因名（对齐序）
@@ -33,6 +33,7 @@ import time
 import numpy as np
 import pandas as pd
 import anndata as ad
+from scipy import sparse
 
 from src.utils.config_utils import CommonConfig, ConfigUtils, FlowConfig
 from src.utils.utils import derive_pert_columns
@@ -81,25 +82,51 @@ def _accumulate_file(path, acc_num, acc_cnt, genes0, cfg):
         lm = (ctx_all == line) & keep
         cells = np.nonzero(lm)[0]
         lo, hi = cells.min(), cells.max() + 1
-        block = a[lo:hi]
-        Xb = block.X.tocsr().astype(np.float32)
-        tg_b = tg_all[lo:hi]
-        k_b = keep[lo:hi]
-        ntc_rows = np.nonzero((tg_b == 'non-targeting') & k_b)[0]
-        if len(ntc_rows):
-            num, cnt = acc_num.get((line, 'non-targeting'), (np.zeros(n_genes), 0))
-            w = 1e6 / np.maximum(np.asarray(Xb[ntc_rows].sum(axis=1)).ravel().astype(np.float64), 1.0)
-            acc_num[(line, 'non-targeting')] = num + np.asarray(Xb[ntc_rows].T @ w).ravel()
-            acc_cnt[(line, 'non-targeting')] = cnt + len(ntc_rows)
-        for p in sorted(set(tg_b[k_b]) - {'non-targeting'}):
-            rows = np.nonzero((tg_b == p) & k_b)[0]
-            w = 1e6 / np.maximum(np.asarray(Xb[rows].sum(axis=1)).ravel().astype(np.float64), 1.0)
-            num, cnt = acc_num.get((line, p), (np.zeros(n_genes), 0))
-            acc_num[(line, p)] = num + np.asarray(Xb[rows].T @ w).ravel()
-            acc_cnt[(line, p)] = cnt + len(rows)
-        del block, Xb
+        # 2026-10-03 分块（用户定案二）：全文件块 int64 读入 + 转换中间
+        # 实测 ~100GB/worker（14 并发 OOM）；按 20 万行分块，峰值 ~20GB。
+        chunk = 200_000
+        for clo in range(lo, hi, chunk):
+            chi = min(clo + chunk, hi)
+            block = a[clo:chi]
+            Xb = block.X.tocsr().astype(np.float32)
+            tg_b = tg_all[clo:chi]
+            k_b = keep[clo:chi]
+            del block
+            if not k_b.all():
+                Xb = Xb[k_b]
+                tg_b = tg_b[k_b]
+            # 2026-10-03 批量算法：扰动指示矩阵 P（每扰动一行 0/1）→
+            # P @ (Xb·w) 一次算出全部扰动的加权列和（O(nnz) 单遍）。
+            rowsum = np.asarray(Xb.sum(axis=1)).ravel().astype(np.float64)
+            w = 1e6 / np.maximum(rowsum, 1.0)
+            tg_codes, tg_uniq = pd.factorize(tg_b)
+            n_p = len(tg_uniq)
+            order = np.argsort(tg_codes, kind='stable')
+            tg_sorted = tg_codes[order]
+            bounds = np.nonzero(tg_sorted[1:] != tg_sorted[:-1])[0] + 1
+            P_ptr = np.concatenate([[0], bounds, [len(tg_b)]])
+            P = sparse.csr_matrix((np.ones(len(tg_b)), order, P_ptr),
+                                  shape=(n_p, len(tg_b)))
+            Xw = Xb.multiply(w[:, None]).tocsr()
+            PM = np.asarray((P @ Xw).todense())     # (n_p, n_genes) 加权列和
+            cnts = np.bincount(tg_codes, minlength=n_p)
+            for j, tg in enumerate(tg_uniq):
+                num = acc_num.get((line, str(tg)), np.zeros(n_genes))
+                cnt = acc_cnt.get((line, str(tg)), 0)
+                acc_num[(line, str(tg))] = num + PM[j]
+                acc_cnt[(line, str(tg))] = cnt + int(cnts[j])
+            del Xb, Xw, PM, P
     a.file.close()
     return list(a.var_names) if genes0 is None else genes0
+
+
+def _accumulate_file_worker(args):
+    """worker（2026-10-03 文件级并行）：单文件独立累积局部 dict。"""
+    path, cfg = args
+    acc_num: dict = {}
+    acc_cnt: dict = {}
+    genes = _accumulate_file(path, acc_num, acc_cnt, None, cfg)
+    return acc_num, acc_cnt, genes
 
 
 def main() -> None:
@@ -119,6 +146,9 @@ def main() -> None:
 
     stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
                     for p in sorted(common.train_set_paths))
+    if len(stem) > 80:  # 2026-10-03：与 data.py/_corpus_stem 同口径 hash 短名
+        import hashlib
+        stem = 'h' + hashlib.sha1(stem.encode()).hexdigest()[:24]
     pool_stem = (os.path.splitext(os.path.basename(str(fcfg.train_pool_path)))[0]
                  if fcfg.train_pool_path else 'all')
     cache_meta = args.cache_meta or os.path.join(
@@ -133,10 +163,22 @@ def main() -> None:
     assert paths, 'train_set_paths 为空且未给 --adata_path'
 
     # ---- 多文件累积：(line, pert) -> CPM 加权均值分子/计数
-    genes0 = None
+    # 2026-10-03 文件级并行（用户定案）：每文件独立累积局部 dict，主进程同键相加。
+    import multiprocessing as mp
+    n_workers = min(getattr(common, 'cache_workers', 1), 8, len(paths))
+    ctx = mp.get_context('fork')
+    with ctx.Pool(n_workers) as pool:
+        results = pool.map(_accumulate_file_worker, [(p, fcfg) for p in paths])
     acc_num, acc_cnt = {}, {}
-    for p in paths:
-        genes0 = _accumulate_file(p, acc_num, acc_cnt, genes0, fcfg)
+    genes0 = results[0][2]
+    n_genes0 = len(genes0)
+    for rn, rc, rg in results:
+        assert rg == genes0, 'worker 返回 var 轴不一致'
+        for k, v in rn.items():
+            num = acc_num.get(k, np.zeros(n_genes0))
+            cnt = acc_cnt.get(k, 0)
+            acc_num[k] = num + v
+            acc_cnt[k] = cnt + rc[k]
     genes_full = genes0
     lines = sorted({k[0] for k in acc_num})
     print(f'[res] accumulated {len(acc_num)} (line, pert) combos, lines={lines}', flush=True)
@@ -154,7 +196,7 @@ def main() -> None:
     assert len(keep_pos) == len(cache_genes), 'cache meta genes not found in corpus var'
     print(f'[res] cache genes {len(cache_genes)}, aligned to corpus var', flush=True)
 
-    # ---- r[c,p]（全轴 11,919，每组合一行）
+    # ---- r[c,p]（全轴 19,843，每组合一行）
     r_rows, combos = [], []
     ctl_mean = {line: acc_num[(line, 'non-targeting')] / acc_cnt[(line, 'non-targeting')]
                 for line in lines}
@@ -166,7 +208,7 @@ def main() -> None:
         r = np.log2((pm + 1.0) / (cm + 1.0)).astype(np.float32)
         r_rows.append(r)
         combos.append((line, p))
-    r_mat = np.vstack(r_rows)                      # (n_combo, 11919)
+    r_mat = np.vstack(r_rows)                      # (n_combo, 19843)
     combos_arr = np.array(combos)
     print(f'[res] r computed {r_mat.shape} in {time.time()-t0:.0f}s', flush=True)
 
