@@ -63,7 +63,7 @@ common:
   cache_workers: 14        # 缓存流式构建并行 worker 数（文件级并行，≤入训文件数）
   # VCC-2026 panel 清单 CSV（2026-09-30 用户定案：mrn19843/pert_counts.csv，300 基因，
   # 全部在 19,843 轴内；与训练语料无关）
-  panel_csv_path: /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/pert_counts.csv
+  panel_csv_path: /home/ict2/Projects/vcc-2026/resources/datasets/controls/pert_counts.csv
   # 残差目标冻结张量目录（rbar_c/rbar_p/gbar/res_<line>.npy/combos.csv）
   # 2026-09-30 起：19,843 轴（mrn19843 语料）专用目录
   frozen_tensors_dir: /home/ict2/Projects/scDFM/output/frozen_tensors_mrn19843
