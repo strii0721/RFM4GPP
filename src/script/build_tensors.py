@@ -78,44 +78,65 @@ def _accumulate_file(path, acc_num, acc_cnt, genes0, cfg):
     lines = sorted(set(ctx_all[keep]))
     print(f'[res] file {path}: {a.shape}, kept {keep.sum()}/{a.n_obs} by '
           f'perturb_direction={cfg.perturb_direction}, lines={lines}', flush=True)
+    # 本文件组合表 + dense 累加数组（2026-10-05 向量化改造：逐扰动 dict 累加
+    # → np.add.at 散射，消除每块 n_p 次 Python 循环）
+    _idx = np.nonzero(keep)[0]
+    _uniq = np.unique(np.char.add(np.char.add(ctx_all[_idx], '||'), tg_all[_idx]))
+    _pairs = [tuple(s.split('||', 1)) for s in _uniq]
+    _row_of = {p: i for i, p in enumerate(_pairs)}
+    acc_num_arr = np.zeros((len(_pairs), n_genes), dtype=np.float64)
+    acc_cnt_arr = np.zeros(len(_pairs), dtype=np.int64)
+    # 文件级预计算：tg 编码（一次 factorize，块内复用）
+    tg_codes_all, tg_uniq_all = pd.factorize(tg_all)
     for line in lines:
         lm = (ctx_all == line) & keep
         cells = np.nonzero(lm)[0]
         lo, hi = cells.min(), cells.max() + 1
-        # 2026-10-03 分块（用户定案二）：全文件块 int64 读入 + 转换中间
-        # 实测 ~100GB/worker（14 并发 OOM）；按 20 万行分块，峰值 ~20GB。
-        chunk = 200_000
+        # 文件级 tg → 组合行号映射（本 line；非本 line 的 tg 置 -1）
+        comb_of_tg = np.full(len(tg_uniq_all), -1, dtype=np.int64)
+        for t in range(len(tg_uniq_all)):
+            comb_of_tg[t] = _row_of.get((line, str(tg_uniq_all[t])), -1)
+        chunk = 50_000        # 2026-10-06 OOM 稳版：块 5 万行（Xb ~2GB/worker）
         for clo in range(lo, hi, chunk):
             chi = min(clo + chunk, hi)
             block = a[clo:chi]
             Xb = block.X.tocsr().astype(np.float32)
-            tg_b = tg_all[clo:chi]
             k_b = keep[clo:chi]
             del block
-            if not k_b.all():
-                Xb = Xb[k_b]
-                tg_b = tg_b[k_b]
-            # 2026-10-03 批量算法：扰动指示矩阵 P（每扰动一行 0/1）→
-            # P @ (Xb·w) 一次算出全部扰动的加权列和（O(nnz) 单遍）。
+            # bincount 直算（2026-10-06 稳版）：sub 1 万行 + 基因分段（16 段），
+            # 峰值 ~0.5GB/sub（此前全块 nnz 级数组 ~30GB → cgroup OOM）。
             rowsum = np.asarray(Xb.sum(axis=1)).ravel().astype(np.float64)
             w = 1e6 / np.maximum(rowsum, 1.0)
-            tg_codes, tg_uniq = pd.factorize(tg_b)
-            n_p = len(tg_uniq)
-            order = np.argsort(tg_codes, kind='stable')
-            tg_sorted = tg_codes[order]
-            bounds = np.nonzero(tg_sorted[1:] != tg_sorted[:-1])[0] + 1
-            P_ptr = np.concatenate([[0], bounds, [len(tg_b)]])
-            P = sparse.csr_matrix((np.ones(len(tg_b)), order, P_ptr),
-                                  shape=(n_p, len(tg_b)))
-            Xw = Xb.multiply(w[:, None]).tocsr()
-            PM = np.asarray((P @ Xw).todense())     # (n_p, n_genes) 加权列和
-            cnts = np.bincount(tg_codes, minlength=n_p)
-            for j, tg in enumerate(tg_uniq):
-                num = acc_num.get((line, str(tg)), np.zeros(n_genes))
-                cnt = acc_cnt.get((line, str(tg)), 0)
-                acc_num[(line, str(tg))] = num + PM[j]
-                acc_cnt[(line, str(tg))] = cnt + int(cnts[j])
-            del Xb, Xw, PM, P
+            sub, GSEG = 10_000, 4_887   # 4 段（段过滤开销与内存的折中）
+            for slo in range(0, Xb.shape[0], sub):
+                shi = min(slo + sub, Xb.shape[0])
+                seg = Xb.indptr[slo:shi + 1]
+                nnz_lo, nnz_hi = int(seg[0]), int(seg[-1])
+                rows_nnz = np.repeat(np.arange(slo, shi), np.diff(seg))
+                kk = k_b[rows_nnz]
+                comb = comb_of_tg[tg_codes_all[clo + rows_nnz][kk]]
+                assert (comb >= 0).all(), 'keep 后组合映射缺失（逻辑错误）'
+                idx_sel = Xb.indices[nnz_lo:nnz_hi][kk].astype(np.int64)
+                dat_sel = Xb.data[nnz_lo:nnz_hi][kk].astype(np.float64) * w[rows_nnz][kk]
+                for g0 in range(0, n_genes, GSEG):
+                    g1 = min(g0 + GSEG, n_genes)
+                    m = (idx_sel >= g0) & (idx_sel < g1)
+                    if not m.any():
+                        del m
+                        continue
+                    flat = comb[m].astype(np.int64) * (g1 - g0) + (idx_sel[m] - g0)
+                    PMg = np.bincount(flat, weights=dat_sel[m],
+                                      minlength=len(_pairs) * (g1 - g0)
+                                      ).reshape(len(_pairs), g1 - g0)
+                    acc_num_arr[:, g0:g1] += PMg
+                    del m, flat, PMg
+                cnts = np.bincount(comb, minlength=len(_pairs))
+                acc_cnt_arr += cnts
+                del rows_nnz, kk, comb, idx_sel, dat_sel
+            del Xb
+    for i, _p in enumerate(_pairs):
+        acc_num[_p] = acc_num_arr[i]
+        acc_cnt[_p] = int(acc_cnt_arr[i])
     a.file.close()
     return list(a.var_names) if genes0 is None else genes0
 
@@ -165,8 +186,10 @@ def main() -> None:
     # ---- 多文件累积：(line, pert) -> CPM 加权均值分子/计数
     # 2026-10-03 文件级并行（用户定案）：每文件独立累积局部 dict，主进程同键相加。
     import multiprocessing as mp
-    n_workers = min(getattr(common, 'cache_workers', 1), 8, len(paths))
-    ctx = mp.get_context('fork')
+    n_workers = min(getattr(common, 'cache_workers', 1), len(paths))
+    # 2026-10-06：fork → spawn（fork 下 18 worker 静默全灭——BLAS/句柄遗产
+    # 类问题无 traceback；spawn 每 worker 全新解释器，免疫此类静默死）
+    ctx = mp.get_context('spawn')
     with ctx.Pool(n_workers) as pool:
         results = pool.map(_accumulate_file_worker, [(p, fcfg) for p in paths])
     acc_num, acc_cnt = {}, {}

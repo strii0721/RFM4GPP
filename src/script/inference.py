@@ -64,6 +64,9 @@ class BenchConfig(FlowConfig):
     # make_path('inference')=<output_base_dir>/inference_<ts>，CLI 值被忽略；
     # eval_external_pred 等工具脚本也借此字段注入目录
     out_dir: str = ''
+    # main 模型 ckpt（2026-10-06 用户定案：推理三模型分别 yaml 指定——
+    # 从 inference 节读；CLI --checkpoint_path 可覆盖）
+    checkpoint_path: str = ''
     # n_ctrl_cells/n_pred_cells/n_real_cells/min_real_cells 已提取到 common 节
     # （2026-09-28 定案：build_tensors real 侧三件套与 inference 共用口径，CommonConfig 声明）
     max_perts: int = 0         # 冒烟上限（0=全部）
@@ -219,7 +222,7 @@ def _norm_log1p(raw: sparse.csr_matrix) -> sparse.csr_matrix:
 
 
 def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[str],
-               real: ad.AnnData, device, context: str = '') -> ad.AnnData:
+               real: ad.AnnData, device, context: str = '', ae=None) -> ad.AnnData:
     """从 heldout_line 对照生成扰动预测：ODE → Reŝ → r̂ = r̄_p − ḡ + Reŝ（r̄_c=0）→
     Poisson(ctrl × 2^{r̂}) counts（范式二，2026-09-26）。
 
@@ -230,7 +233,9 @@ def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[s
     ctx_mask = real.obs['context'].astype(str).to_numpy() == ctx
     ctl_idx_all = np.nonzero(
         ((real.obs['target_gene'].astype(str).to_numpy() == 'non-targeting') & ctx_mask))[0]
-    ctl_raw = real.X[ctl_idx_all].tocsr()          # raw counts 子矩阵
+    # 兼容：对齐副本曾为 dense（2026-10-06 已转 csr，此处防御）
+    ctl_raw = (real.X[ctl_idx_all].tocsr() if hasattr(real.X, 'tocsr')
+               else sparse.csr_matrix(real.X[ctl_idx_all]))  # raw counts 子矩阵
     ctl_norm = _norm_log1p(ctl_raw)                # log1p(CP10k)
 
     # 残差目标常量（范式二）：r̄_p / ḡ，按 modeled 序对齐（r̄_c(RPE1)=0 用户定案）
@@ -266,15 +271,21 @@ def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[s
     # anndata 默认拒绝写（旧轮 real 内存构建=普通 str 无此问题）
     var_df = pd.DataFrame(index=real.var_names.astype(str))
     for i, pert in enumerate(perts):
+        _g0 = time.time()
         part_path = os.path.join(parts_dir, f'pred{tag}_g{i:03d}.h5ad')
         if os.path.exists(part_path):
             part = ad.read_h5ad(part_path)
-            rows.append(part.X.tocsr())
+            # 兼容：旧 part 或新版 anndata 读回可能为 dense ndarray（2026-10-06）
+            rows.append(part.X.tocsr() if hasattr(part.X, 'tocsr') else sparse.csr_matrix(part.X))
             obs_rows.append(part.obs)
-            print(f'pred: reuse part g{i:03d} ({pert}), {len(rows)}/{len(perts)} genes done', flush=True)
+            print(f'[{time.strftime("%Y-%m-%d_%H-%M-%S")}] pred: reuse part g{i:03d} ({pert}), '
+                  f'{len(rows)}/{len(perts)} genes done', flush=True)
             continue
         src_idx = np.sort(rng.choice(len(ctl_idx_all), size=min(cfg.n_pred_cells, len(ctl_idx_all)),
                                      replace=False))
+        print(f'[{time.strftime("%Y-%m-%d_%H-%M-%S")}] ode: start {pert} '
+              f'({i + 1}/{len(perts)}), {cfg.n_pred_cells} cells x {cfg.ode_steps} steps',
+              flush=True)
         src_raw = ctl_raw[src_idx]                        # (n, 18533)
         src_norm = ctl_norm[src_idx]                      # log1p 对照
         depths = np.asarray(src_raw.sum(axis=1)).ravel()
@@ -282,12 +293,25 @@ def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[s
         src_modeled = torch.from_numpy(src_norm[:, modeled_pos_full].toarray()).float().to(device)
         pert_id_b = torch.tensor([vocab.encode(pert)], dtype=torch.long,
                                  device=device).repeat(1, 1)
-        pred_modeled = ode_predict(
-            vf, gene_ids, src_modeled, pert_id_b, cfg.batch_size, cfg.ode_steps,
-            cfg.noise_type, getattr(cfg, 'poisson_alpha', 0.8),
-            getattr(cfg, 'poisson_target_sum', 1e4), device,
-            clamp_output=False,  # 残差空间可负，禁止 clamp（范式二）
-        ).cpu().numpy()
+        if ae is not None:
+            # AE 模式（2026-10-06）：表达 → enc → 潜空间 ODE → dec → Reŝ（基因空间）
+            ae_enc, ae_dec = ae
+            with torch.no_grad():
+                src_latent = ae_enc(src_modeled)
+                pred_latent = ode_predict(
+                    vf, gene_ids, src_latent, pert_id_b, cfg.batch_size, cfg.ode_steps,
+                    cfg.noise_type, getattr(cfg, 'poisson_alpha', 0.8),
+                    getattr(cfg, 'poisson_target_sum', 1e4), device,
+                    clamp_output=False,
+                )
+                pred_modeled = ae_dec(pred_latent).cpu().numpy()
+        else:
+            pred_modeled = ode_predict(
+                vf, gene_ids, src_modeled, pert_id_b, cfg.batch_size, cfg.ode_steps,
+                cfg.noise_type, getattr(cfg, 'poisson_alpha', 0.8),
+                getattr(cfg, 'poisson_target_sum', 1e4), device,
+                clamp_output=False,  # 残差空间可负，禁止 clamp（范式二）
+            ).cpu().numpy()
 
         # 残差恢复（范式二，2026-09-26）：r̂ = r̄_p − ḡ + Reŝ（r̄_c(RPE1)=0），
         # counts ~ Poisson(ctrl × 2^{r̂})；靶基因 r̂=−inf → 2^{−inf}=0 → KD 语义
@@ -316,7 +340,8 @@ def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[s
         obs_rows.append(obs_g)
         ad.AnnData(X=sparse.csr_matrix(counts_full, dtype=np.float32), obs=obs_g,
                    var=var_df).write_h5ad(part_path)
-        print(f'pred: {len(rows)}/{len(perts)} genes done', flush=True)
+        print(f'[{time.strftime("%Y-%m-%d_%H-%M-%S")}] pred: {len(rows)}/{len(perts)} genes done '
+              f'({pert}: {time.time() - _g0:.1f}s)', flush=True)
 
     X = sparse.vstack(rows).tocsr()
     obs_df = pd.concat(obs_rows, ignore_index=True)
@@ -468,15 +493,38 @@ def main() -> None:
     gene_ids = torch.tensor(vocab.encode(modeled), dtype=torch.long, device=device)
     print(f'modeled genes: {len(modeled)}', flush=True)
 
-    vf = instantiate_model(cfg.model_type, ntoken=cfg.ntoken, d_model=cfg.d_model,
+    # AE 模式（2026-10-06 warm-start + 联合微调）：序列=潜 token、扰动表独立、
+    # 共表达 mask 关（潜 token 与基因图尺寸不符）；加载 encoder/decoder。
+    _ae_mode = bool(cfg.ae_encoder_ckpt and cfg.ae_decoder_ckpt)
+    if _ae_mode:
+        from src.models.autoencoder import AEEncoder, AEDecoder
+        ae_enc = AEEncoder(cfg.n_top_genes, 8192, cfg.ae_latent_dim).to(device).eval()
+        ae_dec = AEDecoder(cfg.n_top_genes, 8192, cfg.ae_latent_dim).to(device).eval()
+        ae_enc.load_state_dict(torch.load(cfg.ae_encoder_ckpt, map_location='cpu'))
+        ae_dec.load_state_dict(torch.load(cfg.ae_decoder_ckpt, map_location='cpu'))
+        gene_ids = torch.arange(cfg.ae_latent_dim, dtype=torch.long, device=device)
+        print(f'[AE] inference warm-start loaded latent={cfg.ae_latent_dim}', flush=True)
+
+    vf = instantiate_model(cfg.model_type, ntoken=cfg.resolve_ntoken(), d_model=cfg.d_model,
                            d_perturbation=cfg.d_model, fusion_method=cfg.fusion_method,
-                           perturbation_function=cfg.perturbation_function, mask_path=mask_path)
-    ckpt = torch.load(cfg.checkpoint_path, map_location='cpu')
+                           perturbation_function=cfg.perturbation_function, mask_path=mask_path,
+                           pert_ntoken=cfg.resolve_pert_ntoken(),
+                           use_perturbation_interaction=cfg.use_perturbation_interaction and not _ae_mode)
+    # 三模型分别指定（2026-10-06 用户定案）：main=checkpoint_path（目录时 main_best.pt
+    # 优先/否则最新 main_*.pt）；encoder/decoder 严格从 yaml 的 ae_encoder_ckpt /
+    # ae_decoder_ckpt 读（微调后把新路径填进 yaml 即可，无隐式覆盖）。
+    _ckpt_path = cfg.checkpoint_path
+    if os.path.isdir(_ckpt_path):
+        _best = os.path.join(_ckpt_path, 'main_best.pt')
+        _mains = sorted([p for p in glob.glob(os.path.join(_ckpt_path, 'main_*.pt'))
+                         if 'best' not in p])
+        _ckpt_path = _best if os.path.exists(_best) else (_mains[0] if _mains else _ckpt_path)
+    ckpt = torch.load(_ckpt_path, map_location='cpu')
     vf.load_state_dict(ckpt['model_state_dict'])
     vf = vf.to(device).eval()
 
     pred = build_pred(cfg, vf, gene_ids, vocab, modeled, real, device,
-                      context=cfg.context)
+                      context=cfg.context, ae=(ae_enc, ae_dec) if _ae_mode else None)
     if not cfg.parts_only:
         tag = f'_{cfg.pred_tag}' if cfg.pred_tag else ''
         pred_path = os.path.join(cfg.out_dir, f'pred{tag}.h5ad')
@@ -586,7 +634,8 @@ def dispatch_main() -> None:
 
     ap = argparse.ArgumentParser(description='inference 守护分发（默认入口）',
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--checkpoint_path', required=True)
+    ap.add_argument('--checkpoint_path', default=icfg.checkpoint_path,
+                    help='main 模型 ckpt（缺省取 yaml inference.checkpoint_path）')
     ap.add_argument('--train_set_paths', nargs='*', default=[],
                     help='训练语料文件列表（传给 worker 派生缓存/mask/vocab 键，须与训练时一致）')
     ap.add_argument('--heldout_line', default=icfg.heldout_line)

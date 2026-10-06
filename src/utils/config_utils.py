@@ -48,6 +48,12 @@ class CommonConfig:
     output_base_dir: str
     # 日志基目录（train/build_tensors/inference 三入口共用）
     log_base_dir: str
+    # AE 可学习编解码器接入（2026-10-06 用户定案：warm-start + 联合微调）。
+    # 两路径非空 = AE 模式（主模型序列=潜 token、词表 latent+4、扰动表独立）；
+    # 均为空字符串 = 全轴模式。latent 维数须与 ckpt 一致（默认 4096）。
+    ae_encoder_ckpt: str
+    ae_decoder_ckpt: str
+    ae_latent_dim: int
     # real/pred 细胞数口径（2026-09-28 从 inference 节提取到 common：build_tensors
     # real 侧三件套与 inference 共用；官方 context=18400 取子集控时长）
     n_ctrl_cells: int       # real 侧对照细胞数（ODE 源 / DE 参考组）
@@ -67,7 +73,8 @@ class FlowConfig:
     ntoken: int              # 11,919 全轴基因 + 4 specials = 11,923
     d_model: int
     lr: float                # 论文 Adam lr=5e-5 余弦衰减
-    steps: int               # 2026-09-26 定案：残差范式 ~10k 收敛；--steps 可覆盖
+    steps: int               # 2026-10-05 用户定案：100k + 早停（窗口见 early_stop_patience）
+    early_stop_patience: int  # 早停：print_every 窗口无改善容忍数（0=禁用）
     eta_min: float           # 论文衰减下界 ηmin=1e-6
     devices: str
     test_only: bool
@@ -81,7 +88,11 @@ class FlowConfig:
     print_every: int
     mode: str                # predict_y, predict_p
     perturbation_fusion_method: str  # mlp, sum
-    fusion_method: str       # cross , concat, add
+    fusion_method: str       # cross, concat, add; differential_transformer | differential_perceiver
+    # （num_latents/perceiver_latent 2026-10-06 已删：AE 潜空间方案下 Perceiver 无必要）
+    # （PCA/PC-token 方案 2026-10-06 用户定案删除：data_space/pca_path/n_pcs 字段移除；
+    # AE 可学习编解码器方案保留，接入时另设 ae_encoder_ckpt/ae_decoder_ckpt）
+    use_perturbation_interaction: bool  # false=放弃共表达 mask（PC 模式）
     infer_top_gene: int
     # 2026-09-21 用户定案：训练每步从【完整基因轴】（含 300 panel，固定集合）随机
     # 抽全轴（min 上限 = 缓存列 11,371）。panel 是其他扰动的真实 DEG 不可排除；
@@ -89,7 +100,9 @@ class FlowConfig:
     # n_top_genes=11919 实质保留全部有 dispersion 的列（零方差 548 列剔除，
     # 实测 11,371），缓存 ~87GB。
     n_top_genes: int
-    checkpoint_path: str
+    # checkpoint_path 字段 2026-10-06 移除：训练侧由 resume 取代（CLI --resume），
+    # 推理侧由 BenchConfig 自带字段（inference 节 checkpoint_path）承接
+    resume: str              # 续训入口（CLI --resume；2026-10-05）
     gamma: float             # 论文 MMD λ=0.5
     # replogle 留系（2026-09-17 用户定案）：train 文件（K562/Jurkat/HepG2）全量训练，
     # 无内部留出；测试语料 = 独立文件 test_set_paths（RPE1），benchmark 专用。
@@ -132,6 +145,10 @@ class FlowConfig:
     # 输出基目录 + 日志基目录（common 节；2026-09-29 合并定案）
     output_base_dir: str
     log_base_dir: str
+    # AE 可学习编解码器（common 节；2026-10-06 warm-start + 联合微调定案）
+    ae_encoder_ckpt: str
+    ae_decoder_ckpt: str
+    ae_latent_dim: int
     # real/pred 细胞数口径（common 节；2026-09-28 从 inference 节提取，
     # build_tensors real 侧三件套与 inference 共用）
     n_ctrl_cells: int
@@ -153,6 +170,15 @@ class FlowConfig:
     # 已被 common.perturb_direction 取代（列表白名单，见 CommonConfig），保留仅为兼容。
     crispr_type_col: str
     crispr_type_value: str
+
+    def resolve_ntoken(self) -> int:
+        """AE 方案（2026-10-06）：配了 ae_encoder_ckpt → 主模型序列=潜 token（latent+4）；
+        否则全轴基因词表 ntoken。"""
+        return self.ae_latent_dim + 4 if self.ae_encoder_ckpt else self.ntoken
+
+    def resolve_pert_ntoken(self) -> int | None:
+        """AE 方案：扰动嵌入用独立基因词表（=ntoken）；全轴模式 None（共享主表）。"""
+        return self.ntoken if self.ae_encoder_ckpt else None
 
     def __post_init__(self):
         if self.data_name == 'norman_umi_go_filtered':

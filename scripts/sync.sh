@@ -27,7 +27,9 @@ RSYNC_OPTS=(
   --exclude=data/
   --exclude=result/
   --exclude=output/
-  --exclude=cache/
+  # cache 勿带尾斜杠：远程 cache 是软链（→/ssd4/ict2/cache），rsync 尾斜杠模式
+  # 只匹配目录不匹配软链 → --delete 会删掉远程软链（2026-10-06 事故根因）。
+  --exclude=cache
   --exclude=logs/
   --exclude=.venv/
   # 辅助脚本目录：只同步 *.py（2026-09-28 起辅助脚本统一放 tmp/，被 local/remote

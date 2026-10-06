@@ -11,6 +11,8 @@ def instantiate_model(model_type: str, **kwargs):
             layers = 8
         elif kwargs['fusion_method'] == 'differential_perceiver':
             layers = 4
+        elif kwargs['fusion_method'] == 'perceiver_latent':
+            layers = 4  # 与 differential_perceiver 同层数（2026-10-05，便于对照归因）
         else:
             layers = 8
         # ntoken/d_model 必须透传（2026-09-17）：此前恒用 OriginModel 默认
@@ -18,7 +20,9 @@ def instantiate_model(model_type: str, **kwargs):
         return OriginModel(ntoken=kwargs['ntoken'], d_model=kwargs['d_model'],
                            fusion_method=kwargs['fusion_method'], nlayers=layers,
                            perturbation_function=kwargs['perturbation_function'],
-                           mask_path=kwargs['mask_path'])
+                           mask_path=kwargs['mask_path'],
+                           use_perturbation_interaction=kwargs.get('use_perturbation_interaction', True),
+                           pert_ntoken=kwargs.get('pert_ntoken'))
     else:
         raise ValueError(f"Invalid model type: {model_type}")
     

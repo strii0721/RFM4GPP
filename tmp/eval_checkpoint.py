@@ -12,6 +12,7 @@ Usage:
 """
 import os
 import sys
+from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 2026-09-28: tmp/ 下减一层
 
@@ -26,8 +27,13 @@ from src.models.instantiate_model import instantiate_model
 from src.utils.utils import process_vocab
 
 
+@dataclass
+class _EvalCfg(FlowConfig):
+    checkpoint_path: str = ''   # 2026-10-06：FlowConfig 字段删除后本地自带（CLI 传）
+
+
 def main():
-    config = ConfigUtils.load(FlowConfig, description=__doc__)
+    config = ConfigUtils.load(_EvalCfg, description=__doc__)
     assert config.checkpoint_path and os.path.exists(config.checkpoint_path), "checkpoint_path required"
 
     accelerator = Accelerator()

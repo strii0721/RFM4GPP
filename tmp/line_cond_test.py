@@ -37,6 +37,7 @@ def log(msg):
 
 @dataclass
 class Cfg(FlowConfig):
+    checkpoint_path: str = ''   # 2026-10-06：FlowConfig 字段删除后本地自带（CLI 传）
     out_dir: str = '/ssd1/ict2/Projects/vcc-2026/output/line_cond_test'
     line1: str = 'HEK293T'
     line2: str = 'K562'

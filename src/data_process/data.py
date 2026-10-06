@@ -511,18 +511,13 @@ class Data:
                 # adata_test 给零行空壳，兼容 TestDataset 构造（不用其方法）。
                 print('##### vcc: split/whole step1: mode assign #####', flush=True)
                 self.adata.obs['mode'] = 'train'
-                # 2026-10-03：Drug1/Drug2 由 target_gene 直接构造（condition 列
-                # 是 category dtype，.str.split 在 25M 行上实测卡死）。语义等价：
-                # condition = tg+'+control'（扰动行）/ 'control'（对照行）⇒
-                # split[0] = tg 或 'control'、split[-1] 恒 'control'。
+                # 2026-10-06：删除上游双药物槽位遗留——VCC 单基因 CRISPRi，
+                # 扰动槽=target_gene（对照行 'control'），无第二槽。
                 print('##### vcc: split/whole step2a: tg astype #####', flush=True)
                 tg_arr = self.adata.obs['target_gene'].astype(str).to_numpy()
                 print('##### vcc: split/whole step2b: np.where #####', flush=True)
-                drug1 = np.where(tg_arr == 'non-targeting', 'control', tg_arr)
-                print('##### vcc: split/whole step2c: assign Drug1 #####', flush=True)
-                self.adata.obs['Drug1'] = drug1
-                print('##### vcc: split/whole step3: Drug2 #####', flush=True)
-                self.adata.obs['Drug2'] = 'control'
+                self.adata.obs['target_gene'] = np.where(tg_arr == 'non-targeting', 'control', tg_arr)
+                print('##### vcc: split/whole step2c: assign target_gene #####', flush=True)
                 # 2026-09-17 内存优化：whole 无切片，直接共享引用（TrainSampler 只加
                 # obs 列、无 X 变异；copy() 会让每 rank 多持有一份 ~93GB 矩阵，8 rank 共爆内存）
                 self.adata_train = self.adata
@@ -627,9 +622,10 @@ class Data:
             if self.data_name == 'vcc' and self.config is not None:
                 line_col = getattr(self.config, 'line_col', None)
                 min_tgt_cells = getattr(self.config, 'min_tgt_cells', 1)
-            train_sampler = TrainSampler(self.data_name, self.adata_train, ["Drug1", "Drug2"], self.perturbation_dict,
+            # 2026-10-06：VCC 单基因 CRISPRi——扰动槽单列 target_gene（双药物槽位已删）
+            train_sampler = TrainSampler(self.data_name, self.adata_train, ["target_gene"], self.perturbation_dict,
                                          line_col=line_col, min_tgt_cells=min_tgt_cells)
-            test_sampler = TestDataset(self.data_name, self.adata_test, ["Drug1", "Drug2"], self.perturbation_dict,
+            test_sampler = TestDataset(self.data_name, self.adata_test, ["target_gene"], self.perturbation_dict,
                                        line_col=line_col)
             return train_sampler , test_sampler, []
         else:
@@ -653,14 +649,21 @@ class TrainSampler:
         self.data_name = data_name
         self.adata = adata
         self.perturbation_covariates = perturbation_covariates
-        # 2026-10-03：apply(lambda, axis=1) 在 25M 行上实测卡死（纯 Python 逐行）；
-        # 向量化拼接（object 列 + 是 C 级逐元素）
-        self.adata.obs['perturbation_covariates'] = (
-            self.adata.obs[perturbation_covariates[0]].astype(str) + '+' +
-            self.adata.obs[perturbation_covariates[1]].astype(str))
+        # 2026-10-06：VCC 单槽（target_gene 单列）；保留多列拼接分支兼容组合任务。
+        if len(perturbation_covariates) == 1:
+            self.adata.obs['perturbation_covariates'] = self.adata.obs[perturbation_covariates[0]].astype(str)
+            ctrl_sentinel = 'control'
+        else:
+            # 2026-10-03：apply(lambda, axis=1) 在 25M 行上实测卡死（纯 Python 逐行）；
+            # 向量化拼接（object 列 + 是 C 级逐元素）
+            self.adata.obs['perturbation_covariates'] = (
+                self.adata.obs[perturbation_covariates[0]].astype(str) + '+' +
+                self.adata.obs[perturbation_covariates[1]].astype(str))
+            ctrl_sentinel = 'control+control'
+        self._ctrl_sentinel = ctrl_sentinel   # 单槽='control'，多槽='control+control'（2026-10-06）
         self._perturbation_covariates = adata.obs['perturbation_covariates'].unique()
         
-        self._perturbation_covariates = self._perturbation_covariates[self._perturbation_covariates != 'control+control']
+        self._perturbation_covariates = self._perturbation_covariates[self._perturbation_covariates != ctrl_sentinel]
         
         self._perturbation_covariates.sort()
         self.perturbation_covariates_dict = {perturbation: i for i, perturbation in enumerate(self._perturbation_covariates)}
@@ -690,7 +693,7 @@ class TrainSampler:
             pc = self.adata.obs['perturbation_covariates'].astype(str).to_numpy()
             self._lines = np.unique(lines)
             for L in self._lines:
-                self._ctl_pool[L] = np.nonzero(np.logical_and(lines == L, pc == 'control+control'))[0]
+                self._ctl_pool[L] = np.nonzero(np.logical_and(lines == L, pc == self._ctrl_sentinel))[0]
             # 2026-09-26 向量化：旧实现逐 (pert, line) 做全列字符串比较
             # （8,679×3×225 万 ≈ 580 亿次，实测每次训练启动 ~25 min 纯 CPU）
             # → 每系一次 stable argsort + 边界切分（O(n log n)），池内容完全等价、秒级。
@@ -707,7 +710,7 @@ class TrainSampler:
                 ctl_ok = len(self._ctl_pool[L]) > 0
                 for s, e in zip(starts, ends):
                     pert = spc[s]
-                    if pert == 'control+control':
+                    if pert == self._ctrl_sentinel:
                         continue
                     if (e - s) >= min_tgt_cells and ctl_ok:
                         self._tgt_pool[(pert, L)] = base[order[s:e]]
@@ -740,7 +743,7 @@ class TrainSampler:
                 src_idx = self._ctl_pool[line]
             else:
                 tgt_idx = (self.adata.obs['perturbation_covariates'] == perturbation_id).to_numpy().nonzero()[0]
-                src_idx = (self.adata.obs['perturbation_covariates'] == 'control+control').to_numpy().nonzero()[0]
+                src_idx = (self.adata.obs['perturbation_covariates'] == self._ctrl_sentinel).to_numpy().nonzero()[0]
             tgt_batch_idx = np.random.choice(tgt_idx, batch_size)
             src_batch_idx = np.random.choice(src_idx, batch_size)
             
@@ -765,18 +768,27 @@ class TestDataset:
         self.data_name = data_name
         self.adata = adata
         self.perturbation_covariates = perturbation_covariates
-        # 空 DataFrame（whole 切分的零行测试空壳）上 apply(axis=1) 返回多列 DataFrame
-        # 而非 Series，赋值单列会 ValueError（2026-09-17 实测）——空表给空 Series。
-        # ⚠️ dtype 必须 object：str 扩展类型（StringDtype）的 unique() 返回 StringArray，
-        # 无 .sort() 方法，下一行会 AttributeError；非空路径 apply 产物也是 object。
+        # 2026-10-06：单槽（target_gene 单列）直接用列值；多槽走 join 拼接。
         pc = self.adata.obs[perturbation_covariates]
-        if pc.shape[0] == 0:
-            self.adata.obs['perturbation_covariates'] = pd.Series(index=pc.index, dtype=object)
+        if len(perturbation_covariates) == 1:
+            if pc.shape[0] == 0:
+                self.adata.obs['perturbation_covariates'] = pd.Series(index=pc.index, dtype=object)
+            else:
+                self.adata.obs['perturbation_covariates'] = pc.iloc[:, 0].astype(str)
+            self._ctrl_sentinel = 'control'
         else:
-            self.adata.obs['perturbation_covariates'] = pc.apply(lambda x: '+'.join(x), axis=1)
+            # 空 DataFrame（whole 切分的零行测试空壳）上 apply(axis=1) 返回多列 DataFrame
+            # 而非 Series，赋值单列会 ValueError（2026-09-17 实测）——空表给空 Series。
+            # ⚠️ dtype 必须 object：str 扩展类型（StringDtype）的 unique() 返回 StringArray，
+            # 无 .sort() 方法，下一行会 AttributeError；非空路径 apply 产物也是 object。
+            if pc.shape[0] == 0:
+                self.adata.obs['perturbation_covariates'] = pd.Series(index=pc.index, dtype=object)
+            else:
+                self.adata.obs['perturbation_covariates'] = pc.apply(lambda x: '+'.join(x), axis=1)
+            self._ctrl_sentinel = 'control+control'
         self._perturbation_covariates = adata.obs['perturbation_covariates'].unique()
         
-        self._perturbation_covariates = self._perturbation_covariates[self._perturbation_covariates != 'control+control']
+        self._perturbation_covariates = self._perturbation_covariates[self._perturbation_covariates != self._ctrl_sentinel]
         
         self._perturbation_covariates.sort()
         self.perturbation_covariates_dict = {perturbation: i for i, perturbation in enumerate(self._perturbation_covariates)}
@@ -868,7 +880,7 @@ class PerturbationDataset(Dataset):
         self.batch_size = batch_size
         self.perturbations = sampler._perturbation_covariates
 
-        self.control_idx = (sampler.adata.obs['perturbation_covariates'] == 'control+control').to_numpy().nonzero()[0]
+        self.control_idx = (sampler.adata.obs['perturbation_covariates'] == sampler._ctrl_sentinel).to_numpy().nonzero()[0]
 
         # 残差目标范式（2026-09-26）：(line, pert) -> res_<line>.npy 行号；
         # combos.csv 行序按 line 块（同 build_residual_targets.py 落盘序）。

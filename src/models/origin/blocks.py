@@ -352,3 +352,5 @@ class CrossAttentionTransformerLayer(nn.Module):
 
 #         z = z + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.ln_z3(z), shift_mlp, scale_mlp))
 #         return z
+
+        return x

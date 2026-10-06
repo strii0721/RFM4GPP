@@ -2,6 +2,8 @@ import accelerate
 import torch
 import torch.nn as nn
 import tyro
+import glob
+import shutil
 from src.utils.config_utils import ConfigUtils, FlowConfig as Config
 import torch.nn.functional as F
 import time
@@ -39,6 +41,11 @@ path = AffineProbPath(scheduler=CondOTScheduler())
 # 2026-09-21 用户定案——建模基因子集 = 完整基因轴（固定集合，含 300 panel 列；
 # 推理侧仅对扰动自身靶列置 0），每步从池随机抽 L=infer_top_gene 个基因。
 _pool_idx: torch.Tensor | None = None   # 随机抽样池（缓存列位置）
+# AE 可学习编解码器（2026-10-06 warm-start + 联合微调；train_step 引用）
+_ae_mode = False
+_ae_enc = None
+_ae_dec = None
+_latent_ids: torch.Tensor | None = None
 
 def gaussian_kernel(x, y, sigma=1.0):
     beta = 1.0 / (2.0 * sigma**2)
@@ -103,6 +110,24 @@ def train_step(source, target, res_target, perturbation_id, vf, criterion, accel
     gene = gene_ids.repeat(B,1).to(device)
     gene_input = gene[:,input_gene_ids]
     
+    if mode=="predict_y" and _ae_mode:
+        # AE 方案（2026-10-06 warm-start + 联合微调）：CFM 流匹配搬到潜空间，
+        # 监督目标只在基因空间（潜端点经 dec 回投影 vs res——梯度穿 dec→主模型→enc）。
+        t = torch.rand(B, device=device)
+        res_b = res_target.unsqueeze(0).expand(B, -1)          # (B, n_genes)
+        z_s = _ae_enc(source)                                   # 源潜 (B, latent)
+        z1 = _ae_enc(res_b)                                     # 目标潜端点（梯度回传）
+        z0 = torch.randn_like(z1)
+        z_t = (1 - t)[:, None] * z0 + t[:, None] * z1           # 直线插值
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=getattr(config, 'use_bf16', False)):
+            lid = _latent_ids.unsqueeze(0).expand(B, -1)   # (B, 4096)——GeneEncoder 需 batch 维
+            v_pred = vf(lid, z_t, t, z_s, perturbation_id, lid, mode=mode)
+        loss_cfm = ((v_pred - (z1 - z0)) ** 2).mean()           # 潜空间 CFM 速度匹配
+        z1_hat = z_t + v_pred * (1 - t)[:, None]                # 端点估计（潜）
+        res_hat = _ae_dec(z1_hat)                               # (B, n_genes)
+        loss = loss_cfm + F.mse_loss(res_hat, res_b)            # 基因空间端点（穿 dec）
+        return loss
+
     if mode=="predict_y":
         # source, target = ot_sampler.sample_plan(source, target)
         t = torch.rand(B, device=device)
@@ -339,15 +364,31 @@ if __name__ == "__main__":
     else:
         mask_path = os.path.join(data_manager.data_path, data_manager.data_name, 'mask_fold_' + str(config.fold) + 'topk_' + str(config.topk) + config.split_method + '.pt')
     vf = instantiate_model(config.model_type,
-                           ntoken = config.ntoken,
+                           ntoken = config.resolve_ntoken(),
                            d_model = config.d_model,
                            d_perturbation = config.d_model,
                            fusion_method = config.fusion_method,
                            perturbation_function = config.perturbation_function,
-                           mask_path = mask_path
+                           mask_path = mask_path,
+                           pert_ntoken = config.resolve_pert_ntoken(),
+                           # AE 模式：潜 token 4096 与 19,547 共表达 mask 尺寸不符 → 关
+                           use_perturbation_interaction = config.use_perturbation_interaction and not config.ae_encoder_ckpt,
                            )
     
     model_path = config.make_path()
+
+    # AE warm-start（2026-10-06 用户定案）：加载可学习编解码器、不冻结（联合微调）。
+    _ae_mode = bool(config.ae_encoder_ckpt and config.ae_decoder_ckpt)
+    if _ae_mode:
+        from src.models.autoencoder import AEEncoder, AEDecoder
+        _ae_enc = AEEncoder(config.n_top_genes, 8192, config.ae_latent_dim).to(device)
+        _ae_dec = AEDecoder(config.n_top_genes, 8192, config.ae_latent_dim).to(device)
+        _ae_enc.load_state_dict(torch.load(config.ae_encoder_ckpt, map_location='cpu'))
+        _ae_dec.load_state_dict(torch.load(config.ae_decoder_ckpt, map_location='cpu'))
+        _latent_ids = torch.arange(config.ae_latent_dim, dtype=torch.long, device=device)
+        print(f'[AE] warm-start loaded: {config.ae_encoder_ckpt} / '
+              f'{config.ae_decoder_ckpt} latent={config.ae_latent_dim}（不冻结，联合微调）',
+              flush=True)
 
     vocab = process_vocab(data_manager, config)
 
@@ -393,12 +434,25 @@ if __name__ == "__main__":
     best_loss = float('inf')
     
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(vf.parameters(), lr=config.lr)
+    # AE 联合微调：encoder/decoder 参数并入 optimizer（不冻结；dec 梯度强、enc 隔主模型弱）
+    _ae_params = (list(_ae_enc.parameters()) + list(_ae_dec.parameters())) if _ae_mode else []
+    optimizer = torch.optim.Adam(list(vf.parameters()) + _ae_params, lr=config.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.steps, eta_min=config.eta_min)
     
-    if config.checkpoint_path != '':
-        start_iteration, _ = load_checkpoint(config.checkpoint_path, vf, optimizer, scheduler)
+    ckpt_path = config.resume
+    if ckpt_path:
+        # 续训（2026-10-05 用户定案 --resume <ckpt>）：加载 model+optimizer；
+        # 调度器重建——旧调度 last_epoch 已退至 eta_min，直接继承会全程 lr≈1e-6
+        # 训不动；重建后 lr 从 base 按 config.steps 重新退火，last_epoch=start_iteration。
+        start_iteration, _ = load_checkpoint(ckpt_path, vf, optimizer, scheduler=None,
+                                             ae_enc=_ae_enc if _ae_mode else None,
+                                             ae_dec=_ae_dec if _ae_mode else None)
         start_iteration += 1
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config.steps, eta_min=config.eta_min)
+        scheduler.last_epoch = start_iteration
+        print(f'[resume] {ckpt_path} -> start_iteration={start_iteration}, '
+              f'scheduler rebuilt (T_max={config.steps})', flush=True)
     else:
         start_iteration = 0
     # 关键 2/2（2026-09-17 实测）：DDP 构造的 _verify_params_across_processes 用
@@ -411,7 +465,14 @@ if __name__ == "__main__":
     optimizer, scheduler, dataloader = accelerator.prepare(optimizer,scheduler,dataloader)
     inverse_dict = {v: str(k) for k, v in data_manager.perturbation_dict.items()}
     iteration = start_iteration
-    while iteration < config.steps:
+    # 早停（2026-10-05 用户定案：steps 10k→100k）：以 print_every 窗口平均 loss 为信号
+    # （DDP 下 do_eval 必 False——NCCL 死锁，不能用验证集指标），patience 个窗口无改善
+    # 提前停；best 窗口另存 best_checkpoint.pt。patience=0 禁用。
+    window_loss, window_cnt = 0.0, 0
+    best_window = float('inf')
+    bad_cnt = 0
+    early_stop = False
+    while iteration < config.steps and not early_stop:
         for batch_data in dataloader:
             
             source = batch_data['src_cell_data'].squeeze(0)
@@ -419,8 +480,8 @@ if __name__ == "__main__":
             target = batch_data['tgt_cell_data'].squeeze(0)
             perturbation_id = batch_data['condition_id'].squeeze(0).to(device)
             if config.perturbation_function == 'crisper':
-                # 单槽扰动条件（方案B 2026-09-14）：VCC 单基因任务，只编码 Drug1 目标基因，
-                # 不再拼接 'control' 填充槽（上游双基因组合设计的遗留）；
+                # 单槽扰动条件（2026-10-06）：VCC 单基因 CRISPRi，只编码 target_gene
+                # （上游双药物槽位 Drug1/Drug2 已删）
                 # 提交侧 generate_submission.py 本就是单槽 (B,1)，改后两侧对齐。
                 perturbation_name = [inverse_dict[int(perturbation_id[0, 0].cpu().item())]]
                 perturbation_id = torch.tensor(vocab.encode(perturbation_name), dtype=torch.long, device=device)
@@ -436,6 +497,9 @@ if __name__ == "__main__":
             
             set_requires_grad_for_p_only(vf, p_only=config.mode)
             loss = train_step(source, target, res_target, perturbation_id, vf, criterion, accelerator, noise_type=config.noise_type, mode=config.mode)
+            if accelerator.is_main_process:
+                window_loss += loss.item()
+                window_cnt += 1
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
             optimizer.step()
@@ -446,6 +510,20 @@ if __name__ == "__main__":
                 # lockstep: all ranks wait here so main-process checkpoint save
                 # does not let other ranks race ahead and exit
                 accelerator.wait_for_everyone()
+                # 早停窗口判定（主进程；iteration=0 窗口仅 1 步，跳过不清零）
+                improved = False
+                if accelerator.is_main_process and window_cnt > 1:
+                    avg_w = window_loss / window_cnt
+                    improved = avg_w < best_window - 1e-6
+                    if improved:
+                        best_window = avg_w
+                        bad_cnt = 0
+                    elif config.early_stop_patience > 0:
+                        bad_cnt += 1
+                    print(f'[{time.strftime("%Y-%m-%d_%H-%M-%S")}] [window] '
+                          f'avg_loss={avg_w:.5f} best={best_window:.5f} '
+                          f'bad={bad_cnt}/{config.early_stop_patience}', flush=True)
+                    window_loss, window_cnt = 0.0, 0
                 save_path_ = os.path.join(save_path, f'iteration_{iteration}')
                 os.makedirs(save_path_, exist_ok=True)
                 eval_score = None
@@ -458,8 +536,29 @@ if __name__ == "__main__":
                         iteration=iteration, 
                         eval_score=None,  # 不需要评估分数
                         save_path=save_path_, 
-                        is_best=False
+                        is_best=improved,
+                        ae_enc=_ae_enc if _ae_mode else None,
+                        ae_dec=_ae_dec if _ae_mode else None,
+                        best_dir=save_path,
                     )
+                    # 检查点保留策略（2026-10-06 用户定案）：仅保留近 5 个 + 最好的一个。
+                    # best 三文件由 save_checkpoint 写 best/ 子目录（不在 iteration_N 内混副本）。
+                    _its = sorted(glob.glob(os.path.join(save_path, 'iteration_*')),
+                                  key=lambda p: int(os.path.basename(p).split('_')[1]))
+                    for _old in _its[:-5]:
+                        shutil.rmtree(_old, ignore_errors=True)
+                # 早停触发广播：主进程判定 → all_reduce 全体统一退出（防 DDP 死锁）
+                stop_sig = torch.tensor([1.0 if (accelerator.is_main_process and
+                                                 config.early_stop_patience > 0 and
+                                                 bad_cnt >= config.early_stop_patience)
+                                        else 0.0], device=device)
+                if int(os.environ.get('WORLD_SIZE', '1')) > 1:
+                    torch.distributed.all_reduce(stop_sig)
+                early_stop = stop_sig.item() >= 1.0
+                if accelerator.is_main_process and early_stop:
+                    print(f'[early stop] {config.early_stop_patience} windows without '
+                          f'improvement -> stop at {iteration} (best={best_window:.5f})',
+                          flush=True)
                 if config.do_eval:
                     # NOTE: in-loop eval deadlocks under multi-GPU DDP (other ranks'
                     # first backward all_reduce waits for the main rank while it
@@ -474,10 +573,11 @@ if __name__ == "__main__":
             # 废弃 tqdm 进度条（8 rank 各写一行 + \r 刷屏）；
             # 格式：loss + 进度 n/N + 本 iteration 耗时（含 checkpoint 保存等事件）
             if accelerator.is_main_process:
-                print(f'loss: {loss.item():.4f}, iteration: {iteration}/{config.steps}, '
+                print(f'[{time.strftime("%Y-%m-%d_%H-%M-%S")}] '
+                      f'loss: {loss.item():.4f}, iteration: {iteration}/{config.steps}, '
                       f'{time.time() - it_t0:.2f}s/it', flush=True)
             iteration += 1
-            if iteration >= config.steps:
+            if iteration >= config.steps or early_stop:
                 break
             
     # save final checkpoint if the loop ended without saving this iteration

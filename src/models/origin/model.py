@@ -119,6 +119,7 @@ class model(nn.Module):
                  perturbation_function: str = 'crisper',
                  use_perturbation_interaction: bool = True,
                  mask_path: str = None,
+                 pert_ntoken: int | None = None,
                  ):
         super().__init__()
         self.t_embedder = TimestepEmbedder(d_model)
@@ -133,6 +134,11 @@ class model(nn.Module):
         self.value_encoder_2 = ContinuousValueEncoder(d_model, dropout)
         self.encoder = GeneEncoder(ntoken, d_model,use_perturbation_interaction=use_perturbation_interaction,mask_path=mask_path)
         self.use_perturbation_interaction = use_perturbation_interaction
+        # PC-token（2026-10-05）：pc 模式下序列侧=PC 词表、扰动侧=基因词表，
+        # 两者 vocab 不同 → 扰动用独立嵌入表（gene 模式 None，保持单表共享/ckpt 兼容）。
+        self.encoder_pert = None
+        if pert_ntoken is not None and pert_ntoken != ntoken:
+            self.encoder_pert = GeneEncoder(pert_ntoken, d_model, use_perturbation_interaction=False)
         # if use_perturbation_interaction:
         #     self.perturbation_interaction = CrossAttentionTransformerLayer(d_model, nhead, mlp_ratio=4.0, dropout=dropout)
         
@@ -193,7 +199,8 @@ class model(nn.Module):
         assert perturbation_emb is None or perturbation_id is None
         if perturbation_id is not None:
             if self.perturbation_function == 'crisper':
-                perturbation_emb = self.encoder(perturbation_id)
+                _enc = self.encoder_pert if self.encoder_pert is not None else self.encoder
+                perturbation_emb = _enc(perturbation_id)
                 
             else:
                 perturbation_emb = self.perturbation_embedder(perturbation_id)

@@ -18,6 +18,7 @@
 """
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 2026-09-28: tmp/ 下减一层
 
@@ -41,6 +42,7 @@ ODEDEF_STEPS = 100  # 论文：Euler K=100 均匀步（附录 A.4.3）
 
 @dataclass
 class GenConfig(FlowConfig):
+    checkpoint_path: str = ''   # main 模型 ckpt（2026-10-06：FlowConfig 字段删除后由子类自带，CLI 传）
     controls_dir: str = '/home/ict2/Projects/vcc-2026/resources/datasets/controls'  # context_{A,B,C}.h5ad + gene_names.csv + pert_counts.csv
     mask_fname: str = ''  # '' = 按训练同款公式派生（cache/vcc/mask_fold_...）
     out_dir: str = ''           # partial h5ad 输出目录
@@ -177,8 +179,10 @@ def ode_predict(vf, gene_ids, src_modeled, pert_id_b, batch_size, ode_steps,
     使解差只反映 Euler 截断误差）；None = 随机 randn（benchmark 常规路径）。"""
     L = gene_ids.shape[0]
     preds = []
+    n_batches = (src_modeled.shape[0] + batch_size - 1) // batch_size
     with torch.no_grad():
         for s in range(0, src_modeled.shape[0], batch_size):
+            _b0 = time.time()
             src_b = src_modeled[s:s + batch_size].contiguous()
             pid_b = pert_id_b.repeat(src_b.shape[0], 1)
             if noise is not None:
@@ -205,6 +209,10 @@ def ode_predict(vf, gene_ids, src_modeled, pert_id_b, batch_size, ode_steps,
                 atol=1e-4, rtol=1e-4, method='euler',
             )
             preds.append((torch.clamp(traj[-1], min=0) if clamp_output else traj[-1]).float())
+            print(f'[{time.strftime("%Y-%m-%d_%H-%M-%S")}] ode: batch '
+                  f'{s // batch_size + 1}/{n_batches} done '
+                  f'({src_b.shape[0]} cells x {ode_steps} steps, {time.time() - _b0:.2f}s)',
+                  flush=True)
     return torch.cat(preds, dim=0)
 
 
@@ -255,6 +263,7 @@ def main():
         config.model_type, ntoken=config.ntoken, d_model=config.d_model,
         d_perturbation=config.d_model, fusion_method=config.fusion_method,
         perturbation_function=config.perturbation_function, mask_path=mask_path,
+        num_latents=config.num_latents,  # perceiver_latent 用
     )
     ckpt = torch.load(config.checkpoint_path, map_location='cpu')
     vf.load_state_dict(ckpt['model_state_dict'])

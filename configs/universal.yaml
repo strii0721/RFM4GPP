@@ -11,23 +11,24 @@ common:
   # 17 文件全列出（2026-09-30 用户定案：replogle_rpe1 也作训练集）；
   # 扰动方向筛选由下方 common.perturb_direction 在代码中执行。
   train_set_paths:
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d1_rest.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d1_stim8hr.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d1_stim48hr.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d2_rest.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d2_stim8hr.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d2_stim48hr.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d3_rest.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d3_stim8hr.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d3_stim48hr.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d4_rest.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d4_stim8hr.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/marson_d4_stim48hr.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/nadig_hepg2.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/nadig_jurkat.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/replogle_k562_essential.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/replogle_k562_gwps.h5ad
-    - /home/ict2/Projects/vcc-2026/resources/datasets/mrn19843/replogle_rpe1.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/marson_d1_rest.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/marson_d1_stim8hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/marson_d1_stim48hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/marson_d2_rest.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/marson_d2_stim8hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/marson_d2_stim48hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/marson_d3_rest.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/marson_d3_stim8hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/marson_d3_stim48hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/marson_d4_rest.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/marson_d4_stim8hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/marson_d4_stim48hr.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/nadig_hepg2.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/nadig_jurkat.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/replogle_k562_essential.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/replogle_k562_gwps.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/replogle_rpe1.h5ad
+    - /home/ict2/Projects/vcc-2026/resources/datasets/mrnh19547/h1.h5ad
   # 扰动方向白名单（2026-09-28 用户定案）：训练侧只保留 exo_perturb_subtype 值
   # 在此列表内的细胞。当前 [CRISPRi]=只留敲低（K562 CRISPRa 细胞全部剔除）；
   # 空列表=不过滤。panel 覆盖实测：Nadig 两文件并集对 282 panel ≥20 细胞 282/282。
@@ -60,26 +61,31 @@ common:
     - /home/ict2/Projects/vcc-2026/resources/datasets/controls/context_A.h5ad
     - /home/ict2/Projects/vcc-2026/resources/datasets/controls/context_B.h5ad
     - /home/ict2/Projects/vcc-2026/resources/datasets/controls/context_C.h5ad
-  cache_workers: 14        # 缓存流式构建并行 worker 数（文件级并行，≤入训文件数）
+  cache_workers: 18        # 缓存流式构建并行 worker 数（文件级并行，≤入训文件数=18）
   # VCC-2026 panel 清单 CSV（2026-09-30 用户定案：mrn19843/pert_counts.csv，300 基因，
   # 全部在 19,843 轴内；与训练语料无关）
   panel_csv_path: /home/ict2/Projects/vcc-2026/resources/datasets/controls/pert_counts.csv
   # 残差目标冻结张量目录（rbar_c/rbar_p/gbar/res_<line>.npy/combos.csv）
   # 2026-09-30 起：19,843 轴（mrn19843 语料）专用目录
-  frozen_tensors_dir: /home/ict2/Projects/scDFM/output/frozen_tensors_mrn19843
+  frozen_tensors_dir: /home/ict2/Projects/scDFM/output/frozen_tensors_mrnh19547
   # 训练缓存目录（processed_*.h5ad/.meta 与派生文件；2026-09-28 定案）
   # 2026-09-30：cache 软链 → /ssd4/PubData/ict2/cache（实盘迁移，逻辑路径不变）
-  train_cache_dir: /home/ict2/Projects/scDFM/cache/train_cache_mrn19843
+  train_cache_dir: /home/ict2/Projects/scDFM/cache/train_cache_mrnh19547
+  # AE 可学习编解码器接入（2026-10-06 用户定案：warm-start + 联合微调）
+  ae_encoder_ckpt: /home/ict2/Projects/scDFM/output/autoencoder_ckpts/encoder_2026-10-06_12-34.pt
+  ae_decoder_ckpt: /home/ict2/Projects/scDFM/output/autoencoder_ckpts/decoder_2026-10-06_12-34.pt
+  ae_latent_dim: 4096
 
 # 训练参数（仅 FlowConfig 本身套用；GenConfig/BenchConfig/ScanConfig 子类不套用，
 # 它们的运行态字段走各自 schema 默认 + CLI）
 flow:
   model_type: origin
   batch_size: 96            # 论文全局 batch=96；8 卡 DDP 时 train.py 按 batch_total/gpus 分摊每 rank
-  ntoken: 19847             # 19,843 全轴基因（mrn19843 语料轴）+ 4 specials
+  ntoken: 19551             # 19,547 全轴基因（mrnh19547 语料轴）+ 4 specials
   d_model: 512
   lr: 5.0e-5
-  steps: 10000              # 2026-09-26 定案：残差范式 ~10k 收敛；--steps 可覆盖
+  steps: 100000             # 2026-10-05 用户定案：10k→100k + 早停（见 early_stop_patience）
+  early_stop_patience: 5    # 早停：print_every 窗口数（5×1000=5k 步无改善即停；0=禁用；2026-10-06 10→5）
   eta_min: 1.0e-6
   devices: "1"
   test_only: false
@@ -91,10 +97,11 @@ flow:
   print_every: 1000
   mode: predict_y
   perturbation_fusion_method: sum
-  fusion_method: differential_perceiver
-  infer_top_gene: 19843
-  n_top_genes: 19843        # 2026-09-30：19,843 对齐轴全轴（mrn19843 语料轴，恒等对齐）
-  checkpoint_path: ''
+  fusion_method: differential_transformer  # differential_transformer | differential_perceiver（perceiver_latent 已删 2026-10-06）
+  use_perturbation_interaction: true   # false=放弃共表达 mask
+  infer_top_gene: 19547
+  n_top_genes: 19547        # 2026-10-05：19,547 轴（mrnh19547 语料轴，VCC 对齐）
+  resume: ''                # 续训入口（CLI --resume <ckpt>；2026-10-05；checkpoint_path 已移除 2026-10-06）
   gamma: 0.5                # 论文 MMD λ=0.5（残差范式 use_mmd_loss=false 未启用）
   split_method: whole       # replogle 留系：train 全量训练，测试语料=独立 RPE1 文件
   use_mmd_loss: false       # 残差目标范式去 MMD（2026-09-26 用户定案）
@@ -102,9 +109,7 @@ flow:
   use_negative_edge: true   # 论文 kNN k=30 带符号相关（signed mask）
   topk: 30
   data_path: /home/ict2/Projects/scDFM/tmp
-  batch_total: 16             # 2026-10-03：B=2/卡（旧轮验证口径 160k 样本 ~3.3h）。
-                              # 实测 B=1→8 吞吐只 +9%（L=19,843 flash 注意力带宽受限），
-                              # B=8 墙钟 7.3× 不划算；lr=5e-05 为该 batch 的验证值
+  batch_total: 256            # 2026-10-06：AE 潜空间 4096 → B=32/卡 冒烟口径（8 卡并行验证中）
   gpus: 8                     # torchrun --nproc_per_node 须与此一致；train.py 据此算每 rank batch
   train_pool_path: ''
   line_col: context         # replogle train 文件 context=K562/Jurkat/HepG2
@@ -128,10 +133,13 @@ flow:
 # 单基因推理 part 先落 .partial，全部完成后合并 predictions.h5ad 并清空 .partial；
 # 积分步数等由此节配置，CLI flag 仍可覆盖）
 inference:
+  # main 模型 ckpt（2026-10-06 用户定案：推理三模型分别 yaml 指定——
+  # 训练目录自动取 main_best.pt，或直接填 main_*.pt 文件路径；AE 两路径在 common 节）
+  checkpoint_path: ''
   heldout_line: RPE1        # 留出系（测试集独立文件时仅作标签名）
   ode_steps: 100            # ODE 积分步数（2026-09-26 新残差范式定案 100 步）
-  batch_size: 128           # worker 每基因推理 batch（2026-10-04 用户定案：B=40 实测 24GB，
-                            # 线性外推 B=128 ~77GB 贴 80GB 上限；若 OOM 降回 96-112）
+  batch_size: 100           # worker 每基因推理 batch（2026-10-06 AE 潜空间：400÷100=4 批整；
+                            # 全轴 19547 时代 128 曾贴 77GB，潜空间 4096 下显存零头）
   gpus: 8                   # dispatch 轮询的卡数（可用 < free_mb 的卡自动跳过）
   free_mb: 51200            # 空闲显存门控（MiB）
   poll_s: 10.0              # 轮询周期（秒）

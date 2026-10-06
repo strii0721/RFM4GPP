@@ -1,4 +1,5 @@
 import random
+import time
 import numpy as np
 import torch
 import os
@@ -59,8 +60,23 @@ def make_lognorm_poisson_noise(target_log, alpha=1.0, per_cell_L=None, eps=1e-8)
     return x0_log
 
 
-def save_checkpoint(model, optimizer, scheduler, iteration, eval_score, save_path, is_best=False):
-    """save checkpoint"""
+def _verified_save(obj, path, retries=3, delay=30.0):
+    """torch.save + 落盘校验（2026-10-06：yrfs 瞬时抖动防护——写后 exists+size>0 校验，
+    失败重试 retries 次；覆盖分钟级网络盘挂起，避免"保存静默失败"连带训练崩溃）。"""
+    for attempt in range(retries):
+        torch.save(obj, path)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return
+        print(f"[ckpt] verify failed (attempt {attempt + 1}/{retries}): {path}, "
+              f"retrying in {delay}s", flush=True)
+        time.sleep(delay)
+    raise RuntimeError(f'checkpoint write failed after {retries} retries: {path}')
+
+
+def save_checkpoint(model, optimizer, scheduler, iteration, eval_score, save_path, is_best=False,
+                    ae_enc=None, ae_dec=None, best_dir=None):
+    """三文件 ckpt（2026-10-06 用户定案）：iteration_N/ 内 main_{N}.pt + encoder_{N}.pt +
+    decoder_{N}.pt；improved 时额外写 best_dir/best/ 下 *_best.pt 三文件（不混入 iteration_N）。"""
     checkpoint = {
         'iteration': iteration,
         'model_state_dict': model.state_dict(),
@@ -68,27 +84,50 @@ def save_checkpoint(model, optimizer, scheduler, iteration, eval_score, save_pat
         'scheduler_state_dict': scheduler.state_dict(),
         'eval_score': eval_score,
     }
-    
-    checkpoint_path = os.path.join(save_path, f'checkpoint.pt')
-    torch.save(checkpoint, checkpoint_path)
-    print(f"save checkpoint to: {checkpoint_path}")
-    
-    # If this is the best model, save an extra copy
-    if is_best:
-        best_path = os.path.join(save_path, 'best_checkpoint.pt')
-        torch.save(checkpoint, best_path)
-        print(f"save best checkpoint: {best_path}")
+    _verified_save(checkpoint, os.path.join(save_path, f'main_{iteration}.pt'))
+    if ae_enc is not None:
+        _verified_save(ae_enc.state_dict(), os.path.join(save_path, f'encoder_{iteration}.pt'))
+        _verified_save(ae_dec.state_dict(), os.path.join(save_path, f'decoder_{iteration}.pt'))
+    print(f"save checkpoint to: {os.path.join(save_path, 'main_' + str(iteration) + '.pt')}")
+    if is_best and best_dir is not None:
+        os.makedirs(os.path.join(best_dir, 'best'), exist_ok=True)
+        _verified_save(checkpoint, os.path.join(best_dir, 'best', 'main_best.pt'))
+        if ae_enc is not None:
+            _verified_save(ae_enc.state_dict(), os.path.join(best_dir, 'best', 'encoder_best.pt'))
+            _verified_save(ae_dec.state_dict(), os.path.join(best_dir, 'best', 'decoder_best.pt'))
+        print(f"save best checkpoint to: {os.path.join(best_dir, 'best')}")
 
-def load_checkpoint(checkpoint_path, model, optimizer, scheduler):
-    """load checkpoint"""
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler=None, ae_enc=None, ae_dec=None):
+    """checkpoint_path = iteration 目录（含 main_*.pt/encoder_*.pt/decoder_*.pt）或旧 checkpoint.pt 文件。
+    目录时非 best 的 main_*.pt 优先；AE 权重从同目录 encoder_<suffix>.pt/decoder_<suffix>.pt 读。"""
+    import glob as _glob
+    if os.path.isdir(checkpoint_path):
+        mains = sorted(_glob.glob(os.path.join(checkpoint_path, 'main_*.pt')),
+                       key=lambda p: ('best' in p, p))
+        # best 三文件在 best/ 子目录（2026-10-06 定案），main_*.pt 无时 fallback
+        main_pt = (mains[0] if mains else
+                   os.path.join(checkpoint_path, 'best', 'main_best.pt'))
+    else:
+        main_pt = checkpoint_path
+    if os.path.exists(main_pt):
+        checkpoint = torch.load(main_pt, map_location='cpu')
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if scheduler is not None:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        # AE 联合微调权重恢复（2026-10-06）：同目录 encoder_<suffix>.pt/decoder_<suffix>.pt
+        if ae_enc is not None:
+            d = os.path.dirname(main_pt)
+            b = os.path.basename(main_pt)
+            suffix = 'best' if 'best' in b else b.split('_')[1].split('.')[0]
+            enc_pt = os.path.join(d, f'encoder_{suffix}.pt')
+            if os.path.exists(enc_pt):
+                ae_enc.load_state_dict(torch.load(enc_pt, map_location='cpu'))
+                ae_dec.load_state_dict(torch.load(os.path.join(d, f'decoder_{suffix}.pt'),
+                                                  map_location='cpu'))
         iteration = checkpoint['iteration']
         eval_score = checkpoint.get('eval_score', float('-inf'))
-        print(f"loading {checkpoint_path} checkpoint, iteration: {iteration}, eval_score: {eval_score}")
+        print(f"loading {main_pt} checkpoint, iteration: {iteration}, eval_score: {eval_score}")
         return iteration, eval_score
     else:
         print(f"Checkpoint file not found: {checkpoint_path}")
