@@ -112,7 +112,7 @@ def run_task(cfg: ScanConfig) -> None:
     pert_id_b = torch.tensor([vocab.encode(cfg.gene)], dtype=torch.long,
                              device=device).repeat(1, 1)
     x1 = ode_predict(
-        vf, gene_ids, src_modeled, pert_id_b, cfg.batch_size, cfg.n_steps,
+        vf, gene_ids, src_modeled, pert_id_b, cfg.batch_size_per_gpu, cfg.n_steps,
         'Gaussian', getattr(cfg, 'poisson_alpha', 0.8),
         getattr(cfg, 'poisson_target_sum', 1e4), device,
         clamp_output=False,  # 残差空间可负

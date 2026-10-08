@@ -48,7 +48,7 @@ class GenConfig(FlowConfig):
     out_dir: str = ''           # partial h5ad 输出目录
     shard_id: int = 0
     num_shards: int = 1
-    batch_size: int = field(default=3, kw_only=True)  # ODE 批大小（2026-09-20 全轴 L=11,071：fp32 注意力显存墙 B≤3-4）
+    batch_size_per_gpu: int = field(default=3, kw_only=True)  # ODE 批大小（每卡口径，2026-10-07 重命名）
     seed: int = 42
     ode_steps: int = ODEDEF_STEPS
     top_infer_genes: int = field(default=19843, kw_only=True)  # 建模基因数（2026-09-30 定案=19,843 全轴；select_modeled_genes 内 min 到池大小）
@@ -200,14 +200,28 @@ def ode_predict(vf, gene_ids, src_modeled, pert_id_b, batch_size, ode_steps,
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 gene_emb_c = vf.encoder(gid_b)
                 value_emb_2_c = vf.value_encoder_2(src_b)
-                pert_emb_c = vf.encoder(pid_b).mean(1)
-            traj = torchdiffeq.odeint(
-                lambda t, x: _ode_forward(vf, gene_ids, x, t, src_b, pid_b, device,
-                                          gene_emb_c, value_emb_2_c, pert_emb_c),
-                nb,
-                torch.linspace(0, 1, ode_steps, device=device),
-                atol=1e-4, rtol=1e-4, method='euler',
-            )
+                # 2026-10-06 fix：扰动嵌入走独立扰动表 encoder_pert（AE 模式 19551 行）——
+                # 原 vf.encoder(pid_b) 打进潜词表（4100 行），id>4100 越界 device-assert
+                _enc = (vf.encoder_pert if getattr(vf, 'encoder_pert', None) is not None
+                        else vf.encoder)
+                pert_emb_c = _enc(pid_b).mean(1)
+            # 手写 Euler（等价 method='euler' 的 odeint；2026-10-06 用户定案：每步 ODE
+            # 打印一行带时间戳日志，便于观测单基因积分进度/步速）。
+            # dt 与 linspace(0,1,N) 一致 = 1/(N-1)。
+            _s0 = time.time()
+            t = torch.zeros((), device=device)  # tensor 标量（_ode_forward 内 .to(device) 需要）
+            x = nb
+            dt = 1.0 / (ode_steps - 1)
+            for step in range(1, ode_steps):
+                t_next = t + dt
+                x = x + (t_next - t) * _ode_forward(
+                    vf, gene_ids, x, t, src_b, pid_b, device,
+                    gene_emb_c, value_emb_2_c, pert_emb_c)
+                t = t_next
+                print(f'[{time.strftime("%Y-%m-%d_%H-%M-%S")}] ode: step '
+                      f'{step}/{ode_steps - 1} ({src_b.shape[0]} cells, t={t.item():.4f}, '
+                      f'{time.time() - _s0:.2f}s)', flush=True)
+            traj = x.unsqueeze(0)
             preds.append((torch.clamp(traj[-1], min=0) if clamp_output else traj[-1]).float())
             print(f'[{time.strftime("%Y-%m-%d_%H-%M-%S")}] ode: batch '
                   f'{s // batch_size + 1}/{n_batches} done '
@@ -307,7 +321,7 @@ def main():
         pert_id_b = torch.tensor(vocab.encode([pert]), dtype=torch.long, device=device).repeat(1, 1)
 
         pred_modeled = ode_predict(
-            vf, gene_ids, src_modeled, pert_id_b, config.batch_size, config.ode_steps,
+            vf, gene_ids, src_modeled, pert_id_b, config.batch_size_per_gpu, config.ode_steps,
             config.noise_type, getattr(config, 'poisson_alpha', 0.8),
             getattr(config, 'poisson_target_sum', 1e4), device,
         ).cpu().numpy()  # (400, L) log1p 空间

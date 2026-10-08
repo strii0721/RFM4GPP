@@ -1,11 +1,11 @@
 """训练可学习编解码器（2026-10-05 用户定案：A 方案，全量 25.4M 细胞，纯 MSE）。
 
 用法（8 卡，远程项目根）：
-  torchrun --nproc_per_node=8 -m src.script.train_autoencoder --epochs 30 --batch 4096
+  torchrun --nproc_per_node=8 -m src.script.train_autoencoder --epochs 3 --batch 512
 单卡冒烟：
   .venv/bin/python -m src.script.train_autoencoder --epochs 1 --batch 512 --max-steps 50
 
-产物（rank0 落盘 output/autoencoder_ckpts/，文件名带训练时间戳）：
+产物（rank0 落盘 output/autoencoder_<数据集后缀>/，文件名带训练时间戳；2026-10-07 定案）：
   encoder_<ts>.pt / decoder_<ts>.pt（每 epoch 覆盖同名，kill 后即最后完成 epoch 的权重）
   train.log（loss + 固定 eval 细胞集上的重建保真）
 """
@@ -30,8 +30,8 @@ from src.utils.config_utils import ConfigUtils, FlowConfig  # noqa: E402
 def _eval_recon(enc, dec, x, device):
     """固定细胞集上的重建保真（centered per-gene corr 中位 + MSE）。x 预转常驻 GPU。"""
     with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        z = enc(x)
-        r = dec(z)
+        z, skips = enc(x)
+        r = dec(z, skips)
     xn = x.float().cpu().numpy()
     rn = r.float().cpu().numpy()
     xc = xn - xn.mean(0, keepdims=True)
@@ -49,7 +49,7 @@ def main():
     ap.add_argument('--batch', type=int, default=512)   # 每卡 batch（2026-10-06 用户定：1024→512）
     ap.add_argument('--lr', type=float, default=1e-4)
     ap.add_argument('--hidden', type=int, default=8192)
-    ap.add_argument('--latent', type=int, default=4096)
+    ap.add_argument('--latent', type=int, default=2048)   # 2026-10-07 加深版：latent 2048（h1=8192, h2=4096）
     ap.add_argument('--eval-every', type=int, default=100)
     ap.add_argument('--max-steps', type=int, default=0, help='>0 时限制总步数（冒烟用）')
     ap.add_argument('--seed', type=int, default=0)
@@ -91,10 +91,22 @@ def main():
     steps_per_epoch = N // world // args.batch
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * steps_per_epoch)
 
-    # ---- 输出目录（固定 ckpt 目录；文件名带训练时间戳，2026-10-06 用户定案）----
-    ckpt_dir = os.path.join(cfg.output_base_dir, 'autoencoder_ckpts')
+    # ---- 输出目录（2026-10-07 用户定案：autoencoder_<数据集后缀>，后缀取自缓存目录名
+    # cache_<后缀> 去前缀；固定 ckpt 目录，文件名带训练时间戳）
+    _cache_stem = os.path.basename(cfg.train_cache_dir.rstrip('/'))
+    if _cache_stem.startswith('cache_'):
+        _cache_stem = _cache_stem[len('cache_'):]
+    ckpt_dir = os.path.join(cfg.output_base_dir, f'autoencoder_{_cache_stem}')
     run_ts = os.environ.get('SCDFM_RUN_TS') or time.strftime('%Y-%m-%d_%H-%M')
     if rank == 0:
+        # 日志自落盘（2026-10-07 用户定案：与其他阶段同口径，任务名 pretrain_autoencoder）
+        _log_dir = os.path.join(cfg.log_base_dir, f'pretrain_autoencoder_{run_ts}')
+        os.makedirs(_log_dir, exist_ok=True)
+        _log_f = open(os.path.join(_log_dir, 'train.log'), 'a', buffering=1)
+        os.dup2(_log_f.fileno(), 1)
+        os.dup2(_log_f.fileno(), 2)
+        sys.stdout = _log_f
+        sys.stderr = _log_f
         os.makedirs(ckpt_dir, exist_ok=True)
         print(f'ckpt_dir={ckpt_dir} run_ts={run_ts} epochs={args.epochs} '
               f'batch={args.batch} steps/rank/epoch={steps_per_epoch}', flush=True)
@@ -153,11 +165,13 @@ def main():
                 size=(n_rows, n_genes),
             ).to(dev).to_dense().bfloat16()
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                z = enc_m(x)
-                r = dec_m(z)
+                z, skips = enc_m(x)
+                r = dec_m(z, skips)
                 loss = torch.nn.functional.mse_loss(r, x)
             opt.zero_grad()
             loss.backward()
+            # 梯度裁剪（2026-10-07 修复 loss 爆炸：防单步大梯度打飞权重）
+            torch.nn.utils.clip_grad_norm_(list(enc_m.parameters()) + list(dec_m.parameters()), 1.0)
             opt.step()
             sched.step()
             step += 1

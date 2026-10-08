@@ -8,8 +8,8 @@ import pickle
 from typing import Union, Optional
 from pathlib import Path
 import os
+import time
 from src.utils._preprocessing import annotate_compounds, get_molecular_fingerprints
-import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import pdb
 import tqdm
@@ -45,7 +45,7 @@ def _scan_cache_file(path, cfg):
     """缓存流式构建第一遍（2026-09-30）：backed 只读 obs + X.indptr，
     行过滤（perturb_direction）→ keep 掩码与 nnz 统计。"""
     a = sc.read_h5ad(path, backed='r')
-    obs = derive_pert_columns(a.obs, cfg.obs_col_candidates, cfg.ctrl_sentinels)
+    obs = derive_pert_columns(a.obs)
     keep = np.ones(a.n_obs, dtype=bool)
     if cfg.perturb_direction and 'exo_perturb_subtype' in obs:
         keep = obs['exo_perturb_subtype'].astype(str).isin(cfg.perturb_direction).to_numpy()
@@ -59,9 +59,20 @@ def _scan_cache_file(path, cfg):
 
 def _process_cache_file(args):
     """缓存流式构建第二遍（2026-09-30）：backed 行块读 → 行过滤 → CP10k+log1p
-    → float32 写入 memmap 预分区段；obs 分片写 parquet；返回列和（零列验证）。"""
+    → float32 写入 memmap 预分区段；obs 分片写 parquet；返回列和（零列验证）。
+    per-stem 独立日志（2026-10-07 用户定案）：进度行写 <log_dir>/<stem>.log。"""
     (path, cfg, row_off, nnz_off, keep, data_f, idx_f, ptr_f,
-     obs_parquet, block_rows) = args
+     obs_parquet, block_rows, log_path) = args
+    import time as _t
+    _t0 = _t.time()
+    _stem = os.path.splitext(os.path.basename(path))[0]
+    _logf = open(log_path, 'a', buffering=1)
+
+    def _log(msg: str) -> None:
+        print(msg, flush=True)
+        _logf.write(msg + '\n')
+
+    _log(f'[{_stem}] start: keep={int(keep.sum()):,} rows')
     # np.load(mmap_mode='r+') 正确读 header 并映射数据区；np.memmap(mode='r+')
     # 会从 offset 0 映射、写入时覆盖 npy header（实测踩坑，2026-09-30）
     d_mm = np.load(data_f, mmap_mode='r+')
@@ -70,7 +81,7 @@ def _process_cache_file(args):
     a = sc.read_h5ad(path, backed='r')
     n = a.n_obs
     # obs 分片（derive + 方向过滤 + 派生列）落盘，主进程合并
-    obs = derive_pert_columns(a.obs, cfg.obs_col_candidates, cfg.ctrl_sentinels)
+    obs = derive_pert_columns(a.obs)
     obs_kept = obs.iloc[np.nonzero(keep)[0]].copy()
     tg = obs_kept['target_gene'].astype(str).to_numpy()
     obs_kept['condition'] = np.where(tg == 'non-targeting', 'control', tg + '+control')
@@ -83,7 +94,9 @@ def _process_cache_file(args):
     p_mm[row_off:row_off + len(seg_ptr)] = seg_ptr + nnz_off
     col_sums = np.zeros(a.n_vars, dtype=np.float64)
     w = nnz_off
-    for lo in range(0, n, block_rows):
+    n_blk = (n + block_rows - 1) // block_rows
+    _log_every = max(1, n_blk // 10)
+    for bi, lo in enumerate(range(0, n, block_rows)):
         hi = min(lo + block_rows, n)
         blk = a[lo:hi]
         k = keep[lo:hi]
@@ -101,7 +114,11 @@ def _process_cache_file(args):
         w += m
         col_sums += np.asarray(Xb.sum(axis=0)).ravel()
         del Xb
+        if bi % _log_every == 0:
+            _log(f'[{_stem}] block {bi}/{n_blk} (rows {hi:,}/{n:,}, {_t.time() - _t0:.0f}s)')
     a.file.close()
+    _log(f'[{_stem}] done: {n:,} rows processed in {_t.time() - _t0:.0f}s')
+    _logf.close()
     return col_sums
 
 
@@ -137,16 +154,21 @@ def _streaming_build_cache(cfg, cache, paths):
         mm = np.lib.format.open_memmap(fn, dtype=dt, mode='w+', shape=shape)
         mm.flush()
         _hold.append(mm)
-    # 第二遍：并行处理（写各自预分区段）
+    # 第二遍：并行处理（写各自预分区段）；per-stem 独立日志（2026-10-07 用户定案）
     obs_dir = cache + '.obs_parts'
     os.makedirs(obs_dir, exist_ok=True)
+    _ts = os.environ.get('SCDFM_RUN_TS') or time.strftime('%Y-%m-%d_%H-%M')
+    _log_dir = os.path.join(cfg.log_base_dir, f'build_cache_{_ts}')
+    os.makedirs(_log_dir, exist_ok=True)
     row_off, nnz_off = 0, 0
     tasks = []
     for i, p in enumerate(paths):
         if n_kepts[i] == 0:      # 该文件被方向白名单整滤（如 CRISPRa 文件）
             continue
+        stem = os.path.splitext(os.path.basename(p))[0]
         tasks.append((p, cfg, row_off, nnz_off, keeps[i], data_f, idx_f, ptr_f,
-                      os.path.join(obs_dir, f'obs_{i:02d}.pkl'), 100_000))
+                      os.path.join(obs_dir, f'obs_{i:02d}.pkl'), 100_000,
+                      os.path.join(_log_dir, f'{stem}.log')))
         row_off += n_kepts[i]
         nnz_off += int(nnz_rows[i].sum())
     with ctx.Pool(nw) as pool:

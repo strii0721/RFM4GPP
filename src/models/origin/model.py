@@ -211,7 +211,8 @@ class model(nn.Module):
                 perturbation_emb = perturbation_emb.unsqueeze(0)
             if perturbation_emb.size(0) == 1:
                 perturbation_emb = perturbation_emb.expand(cell_1.shape[0], -1).contiguous()
-            perturbation_emb = self.perturbation_embedder.enc_norm(perturbation_emb)
+            # 2026-10-06 fix：去掉 enc_norm——id 分支（训练路径）mean(1) 后直接用，
+            # cache 分支（推理）多一层 LayerNorm 会与训练口径错位
         
         return perturbation_emb
     

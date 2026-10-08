@@ -115,16 +115,16 @@ def train_step(source, target, res_target, perturbation_id, vf, criterion, accel
         # 监督目标只在基因空间（潜端点经 dec 回投影 vs res——梯度穿 dec→主模型→enc）。
         t = torch.rand(B, device=device)
         res_b = res_target.unsqueeze(0).expand(B, -1)          # (B, n_genes)
-        z_s = _ae_enc(source)                                   # 源潜 (B, latent)
-        z1 = _ae_enc(res_b)                                     # 目标潜端点（梯度回传）
+        z_s, _ = _ae_enc(source)                                 # 源潜 (B, latent)
+        z1, skips1 = _ae_enc(res_b)                              # 目标潜端点（梯度回传）
         z0 = torch.randn_like(z1)
         z_t = (1 - t)[:, None] * z0 + t[:, None] * z1           # 直线插值
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=getattr(config, 'use_bf16', False)):
-            lid = _latent_ids.unsqueeze(0).expand(B, -1)   # (B, 4096)——GeneEncoder 需 batch 维
+            lid = _latent_ids.unsqueeze(0).expand(B, -1)   # (B, latent)——GeneEncoder 需 batch 维
             v_pred = vf(lid, z_t, t, z_s, perturbation_id, lid, mode=mode)
         loss_cfm = ((v_pred - (z1 - z0)) ** 2).mean()           # 潜空间 CFM 速度匹配
         z1_hat = z_t + v_pred * (1 - t)[:, None]                # 端点估计（潜）
-        res_hat = _ae_dec(z1_hat)                               # (B, n_genes)
+        res_hat = _ae_dec(z1_hat, skips1)                        # (B, n_genes)，对称跳连
         loss = loss_cfm + F.mse_loss(res_hat, res_b)            # 基因空间端点（穿 dec）
         return loss
 
@@ -301,7 +301,7 @@ if __name__ == "__main__":
     os.environ['SCDFM_RUN_TS'] = ts
     rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
     config = ConfigUtils.load(Config)
-    config.batch_size = config.batch_total // config.gpus  # 每 rank batch（B=2/卡）
+    # 2026-10-07：batch_size_per_gpu 即每 rank batch，不再由 batch_total 分摊
 
     if rank == 0:
         log_dir = os.path.join(config.log_base_dir, f'train_{ts}')
@@ -350,9 +350,9 @@ if __name__ == "__main__":
 
     data_manager.load_data(config.data_name)
     data_manager.process_data(n_top_genes=config.n_top_genes, infer_top_gene=config.infer_top_gene, split_method=config.split_method, fold=config.fold, use_negative_edge=config.use_negative_edge, k=config.topk)
-    train_sampler, valid_sampler, test_dl = data_manager.load_flow_data(batch_size=config.batch_size)
+    train_sampler, valid_sampler, test_dl = data_manager.load_flow_data(batch_size=config.batch_size_per_gpu)
     
-    train_dataset = PerturbationDataset(train_sampler, config.batch_size,
+    train_dataset = PerturbationDataset(train_sampler, config.batch_size_per_gpu,
                                         residual_dir=config.frozen_tensors_dir)
     dataloader = DataLoader(train_dataset, batch_size=1, shuffle=False,num_workers=config.num_workers,pin_memory=True,persistent_workers=True)  # batch_size=1 因为每个getitem本身就是一个batch
     # data.py computes the (per-corpus / per-fold) mask path and exposes it;
@@ -371,7 +371,7 @@ if __name__ == "__main__":
                            perturbation_function = config.perturbation_function,
                            mask_path = mask_path,
                            pert_ntoken = config.resolve_pert_ntoken(),
-                           # AE 模式：潜 token 4096 与 19,547 共表达 mask 尺寸不符 → 关
+                           # AE 模式：潜 token 与基因共表达 mask 尺寸不符 → 关
                            use_perturbation_interaction = config.use_perturbation_interaction and not config.ae_encoder_ckpt,
                            )
     
@@ -565,7 +565,7 @@ if __name__ == "__main__":
                     # evaluates). Only safe for single-GPU runs; DDP training must
                     # use --no-do_eval and evaluate from checkpoints afterwards.
                     if accelerator.is_main_process:
-                        eval_score = test(valid_sampler, vf, accelerator, batch_size=config.batch_size, path=save_path_,vocab=vocab)
+                        eval_score = test(valid_sampler, vf, accelerator, batch_size=config.batch_size_per_gpu, path=save_path_,vocab=vocab)
                 
             accelerator.wait_for_everyone()
             

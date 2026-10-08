@@ -35,7 +35,7 @@ import pandas as pd
 import anndata as ad
 from scipy import sparse
 
-from src.utils.config_utils import CommonConfig, ConfigUtils, FlowConfig
+from src.utils.config_utils import ConfigUtils, FlowConfig
 from src.utils.utils import derive_pert_columns
 
 
@@ -63,10 +63,10 @@ def _accumulate_file(path, acc_num, acc_cnt, genes0, cfg):
 
     cfg.perturb_direction：扰动方向白名单。非空时按 exo_perturb_subtype 剔除
     不在列表内的细胞（keep 掩码与文件行号对齐，2026-09-28 定案：与缓存构建
-    同口径）；cfg.obs_col_candidates/ctrl_sentinels 供 derive_pert_columns 匹配。
+    同口径）。derive_pert_columns 直查 target_gene/context（2026-10-07 定案）。
     """
     a = ad.read_h5ad(path, backed='r')
-    obs = derive_pert_columns(a.obs, cfg.obs_col_candidates, cfg.ctrl_sentinels)
+    obs = derive_pert_columns(a.obs)
     if genes0 is not None:
         assert list(a.var_names) == genes0, f'var 轴不一致: {path}'
     n_genes = a.n_vars
@@ -161,32 +161,31 @@ def main() -> None:
                     help='覆盖：输出目录（默认 common.frozen_tensors_dir）')
     args = ap.parse_args()
 
-    common = ConfigUtils.load(CommonConfig, use_cli=False)
-    fcfg = ConfigUtils.load(FlowConfig, use_cli=False)
-    out_dir = args.out_dir or common.frozen_tensors_dir
+    fcfg = ConfigUtils.load(FlowConfig, use_cli=False, extra_sections=('build_tensors',))
+    out_dir = args.out_dir or fcfg.frozen_tensors_dir
 
     stem = '+'.join(os.path.splitext(os.path.basename(str(p)))[0]
-                    for p in sorted(common.train_set_paths))
+                    for p in sorted(fcfg.train_set_paths))
     if len(stem) > 80:  # 2026-10-03：与 data.py/_corpus_stem 同口径 hash 短名
         import hashlib
         stem = 'h' + hashlib.sha1(stem.encode()).hexdigest()[:24]
     pool_stem = (os.path.splitext(os.path.basename(str(fcfg.train_pool_path)))[0]
                  if fcfg.train_pool_path else 'all')
     cache_meta = args.cache_meta or os.path.join(
-        common.train_cache_dir,
+        fcfg.train_cache_dir,
         f'processed_n{fcfg.n_top_genes}_{stem}_{pool_stem}.h5ad.meta.h5ad')
 
-    _self_log('tensors', common.log_base_dir)
+    _self_log('build_tensors', fcfg.log_base_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     t0 = time.time()
-    paths = [args.adata_path] if args.adata_path else list(common.train_set_paths)
+    paths = [args.adata_path] if args.adata_path else list(fcfg.train_set_paths)
     assert paths, 'train_set_paths 为空且未给 --adata_path'
 
     # ---- 多文件累积：(line, pert) -> CPM 加权均值分子/计数
     # 2026-10-03 文件级并行（用户定案）：每文件独立累积局部 dict，主进程同键相加。
     import multiprocessing as mp
-    n_workers = min(getattr(common, 'cache_workers', 1), len(paths))
+    n_workers = min(getattr(fcfg, 'cache_workers', 1), len(paths))
     # 2026-10-06：fork → spawn（fork 下 18 worker 静默全灭——BLAS/句柄遗产
     # 类问题无 traceback；spawn 每 worker 全新解释器，免疫此类静默死）
     ctx = mp.get_context('spawn')

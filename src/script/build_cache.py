@@ -41,13 +41,13 @@ def build_cache(cfg):
 
 
 def main() -> None:
-    cfg = ConfigUtils.load(FlowConfig, use_cli=False)
+    cfg = ConfigUtils.load(FlowConfig, use_cli=False, extra_sections=('build_cache',))
     # 2026-10-03 调试：25M 行 obs 操作某些步骤实测卡死（无 traceback、CPU 满），
     # 定时 dump 当前 Python 栈到日志（stderr 已重定向）定位卡点；正常结束前取消。
     import faulthandler
     faulthandler.dump_traceback_later(300, exit=False)
     ts = os.environ.get('SCDFM_RUN_TS') or datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
-    log_dir = os.path.join(cfg.log_base_dir, f'cache_{ts}')
+    log_dir = os.path.join(cfg.log_base_dir, f'build_cache_{ts}')
     os.makedirs(log_dir, exist_ok=True)
     log_f = open(os.path.join(log_dir, 'build.log'), 'a', buffering=1)
     os.dup2(log_f.fileno(), 1)

@@ -5,7 +5,7 @@
 - 优先级：CLI 显式参数（tyro 以 Optional schema 解析，只取显式传入的 flag）> YAML。
 - 节语义：
     common 节 —— 对所有配置类生效（语料列表 / panel CSV / 冻结张量目录）。
-    flow 节 —— 对 FlowConfig 及其子类生效；子类自身重定义的字段（如 batch_size）
+    flow 节 —— 对 FlowConfig 及其子类生效；子类自身重定义的字段（如 batch_size_per_gpu）
                不被 YAML 覆盖，走子类默认 + CLI。
 - 子类（GenConfig/BenchConfig/ScanConfig）自身的运行态字段保留各自默认值，
   不在 universal.yaml 中配置（per-task 参数走 CLI）。
@@ -13,7 +13,7 @@
 import dataclasses
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -25,51 +25,15 @@ UNIVERSAL_YAML = os.path.join(_PROJECT_ROOT, 'configs', 'universal.yaml')
 
 
 @dataclass
-class CommonConfig:
-    """公共路径配置（无默认值；全部从 universal.yaml common 节读入）。"""
-    train_set_paths: list[str]
-    test_set_paths: str
-    inference_control_paths: list[str]  # 推理 control 多源（2026-09-30 用户定案）
-    cache_workers: int   # 缓存流式构建的并行 worker 数（2026-09-30：文件级并行，≤文件数）
-    panel_csv_path: str
-    frozen_tensors_dir: str
-    train_cache_dir: str
-    # 扰动方向白名单（2026-09-28 用户定案）：训练侧只保留 exo_perturb_subtype 值
-    # 在此列表内的细胞。当前 [CRISPRi]=只留敲低；空列表=不过滤。
-    perturb_direction: list[str]
-    # obs 语义列匹配表（2026-09-28 用户定案）：不同数据集构建方表头命名相互独立，
-    # 每个语义字段按候选列表顺序取第一个匹配上的列（derive_pert_columns）。
-    obs_col_candidates: dict
-    # 扰动基因列中的对照哨兵值（无 ctrl_flag 候选列时用于判定对照）。
-    ctrl_sentinels: list[str]
-    # checkpoint 基路径（2026-09-28 定案：train.py 在此基名下拼 _<ts>/iteration_N）
-    # 输出基目录（train checkpoint 与 inference 产物共用，2026-09-29 合并定案；
-    # 代码拼 <基目录>/<任务名>_<ts>，如 output/train_<ts>、output/inference_<ts>）
-    output_base_dir: str
-    # 日志基目录（train/build_tensors/inference 三入口共用）
-    log_base_dir: str
-    # AE 可学习编解码器接入（2026-10-06 用户定案：warm-start + 联合微调）。
-    # 两路径非空 = AE 模式（主模型序列=潜 token、词表 latent+4、扰动表独立）；
-    # 均为空字符串 = 全轴模式。latent 维数须与 ckpt 一致（默认 4096）。
-    ae_encoder_ckpt: str
-    ae_decoder_ckpt: str
-    ae_latent_dim: int
-    # real/pred 细胞数口径（2026-09-28 从 inference 节提取到 common：build_tensors
-    # real 侧三件套与 inference 共用；官方 context=18400 取子集控时长）
-    n_ctrl_cells: int       # real 侧对照细胞数（ODE 源 / DE 参考组）
-    n_pred_cells: int       # 每扰动预测细胞数（官方 400）
-    n_real_cells: int       # real 侧每扰动参考细胞数上限（不足用全部真实细胞）
-    min_real_cells: int     # real 侧每扰动最少细胞数（低于则跳过该基因）
-
-
-@dataclass
 class FlowConfig:
-    """训练/模型配置（无默认值；全部从 universal.yaml flow 节读入）。"""
+    """训练/模型配置（无默认值；全部从 universal.yaml 读入）。
+    2026-10-06 重组：合并 network + train 两节（common 节已删除，字段拆入各阶段段）；
+    入口需要其他段的字段时经 extra_sections 覆盖。"""
     # Flow model type
     model_type: str
 
     # Flow Matching specific parameters（默认=论文附录 A.4.3 口径）
-    batch_size: int          # 论文全局 batch=96；8 卡 DDP 时 train.py 按 batch_total/gpus 分摊到每 rank
+    batch_size_per_gpu: int  # 每卡 batch size（2026-10-07 重命名定案：全局 batch = 此值 × gpus）
     ntoken: int              # 11,919 全轴基因 + 4 specials = 11,923
     d_model: int
     lr: float                # 论文 Adam lr=5e-5 余弦衰减
@@ -77,7 +41,6 @@ class FlowConfig:
     early_stop_patience: int  # 早停：print_every 窗口无改善容忍数（0=禁用）
     eta_min: float           # 论文衰减下界 ηmin=1e-6
     devices: str
-    test_only: bool
     # Perturbation related parameters
     data_name: str
     perturbation_function: str
@@ -87,7 +50,6 @@ class FlowConfig:
 
     print_every: int
     mode: str                # predict_y, predict_p
-    perturbation_fusion_method: str  # mlp, sum
     fusion_method: str       # cross, concat, add; differential_transformer | differential_perceiver
     # （num_latents/perceiver_latent 2026-10-06 已删：AE 潜空间方案下 Perceiver 无必要）
     # （PCA/PC-token 方案 2026-10-06 用户定案删除：data_space/pca_path/n_pcs 字段移除；
@@ -117,46 +79,44 @@ class FlowConfig:
     # data_path = 缓存/共表达图/split 产物根目录。2026-09-20 用户定案：项目整体
     # 迁至家目录 /home/ict2/Projects（软链接 → /share/ict2/Projects 共享盘 20T）。
     data_path: str
-    batch_total: int          # 全局 batch（train.py 按 gpus 分摊到每 rank）
     gpus: int                 # DDP 卡数（torchrun --nproc_per_node 须一致）
     # 训练语料文件列表：位置在 universal.yaml common 节配置（2026-09-28 用户定案，
     # 启动勿需 --train_set_paths flag；tyro 仍可覆盖）。建缓存时按序读入并沿 obs 拼接
     # （var 轴须逐文件一致）。
     train_set_paths: list[str]
     panel_csv_path: str          # VCC-2026 官方 300 panel 清单（竞赛固定，与训练语料无关）
-    test_set_paths: str    # 竞赛留系真实侧（RPE1），benchmark 专用
-    inference_control_paths: list[str]  # 推理 control 多源（2026-09-30 用户定案；common 节）
+    test_set_paths: str = field(default='', kw_only=True)    # 竞赛留系真实侧（RPE1），inference 节配置；训练入口默认为空（2026-10-06 拆段）
+    inference_control_paths: list = field(default_factory=list, kw_only=True)  # 推理 control 多源（inference 节；训练入口默认为空）
     cache_workers: int   # 缓存流式构建并行 worker 数（2026-09-30；common 节）
     train_pool_path: str     # 训练每步采样池（非空=基因清单；空串=整个基因轴，含 panel，2026-09-21 定案）
     line_col: str            # replogle train 文件 context=K562/Jurkat/HepG2（obs 无 cell_line 列）
-    max_len: int
-    max_len_batch: int
-    heldout_line: str        # single_line 留系口径（RPE1）；whole 口径下被 test_set_paths 取代
+    heldout_line: str        # build_real 完整版（本地 benchmark 留一系口径）按 line_col 提取的系标签
     # 残差目标范式（2026-09-26 用户定案）：冻结三张量目录（rbar_c/rbar_p/gbar/res_*）
     # 位置在 universal.yaml common 节配置（2026-09-28）
     frozen_tensors_dir: str
     train_cache_dir: str      # 训练缓存目录（processed_*.h5ad/.meta；common 节配置）
+    # 推理输出基因轴清单（2026-10-07 用户定案，原 eval_genes_csv 更名）：输出的
+    # predictions.h5ad 对齐到该 CSV 指定的基因轴（按清单顺序取列 + 缺失基因补零列）；
+    # 空 = 保持 real 训练轴不裁剪。inference 只生成扰动预测，输出轴与评测轴同属此配置；
+    # 亦为 submit.py 缺省 --genes_vcc 来源。
+    output_genes_csv: str = field(default='', kw_only=True)
     # 扰动方向白名单（common 节；2026-09-28 定案）：训练侧只保留 exo_perturb_subtype
     # 值在此列表内的细胞。当前 [CRISPRi]=只留敲低；空列表=不过滤。
     perturb_direction: list[str]
-    # obs 语义列匹配表 + 对照哨兵值（common 节；2026-09-28 定案，derive_pert_columns 用）
-    obs_col_candidates: dict
-    ctrl_sentinels: list[str]
-    # 输出基目录 + 日志基目录（common 节；2026-09-29 合并定案）
+    # 输出基目录 + 日志基目录（2026-10-06 用户定案：拆到各阶段段——训练入口的
+    # 值来自 train 节；inference/build_cache/build_tensors/benchmark 各自段配同名字段覆盖）
     output_base_dir: str
     log_base_dir: str
     # AE 可学习编解码器（common 节；2026-10-06 warm-start + 联合微调定案）
     ae_encoder_ckpt: str
     ae_decoder_ckpt: str
     ae_latent_dim: int
-    # real/pred 细胞数口径（common 节；2026-09-28 从 inference 节提取，
-    # build_tensors real 侧三件套与 inference 共用）
-    n_ctrl_cells: int
-    n_pred_cells: int
-    n_real_cells: int
-    min_real_cells: int
-    condition_token_ratio: float  # 条件单元格采样比例（per batch）
-    condition_max_tokens: int     # 条件单元格 token 上限（Perceiver 输入）
+    # real/pred 细胞数口径（inference/build_tensors 节；2026-10-06 拆段，
+    # 训练入口默认为 0 不参与）
+    n_ctrl_cells: int = field(default=0, kw_only=True)
+    n_pred_cells: int = field(default=0, kw_only=True)
+    n_real_cells: int = field(default=0, kw_only=True)
+    min_real_cells: int = field(default=0, kw_only=True)
     mask_subsample: int       # cells for co-expression graph (0 = all)
     max_test_perts: int       # cap on perturbations evaluated per checkpoint (0 = all)
     num_workers: int          # DataLoader workers per rank
@@ -166,10 +126,6 @@ class FlowConfig:
     # many cells for the line to be eligible; measured 2026-09-11 on the merged
     # corpus (iscr12g+xatlas+replogle): >=20 keeps ~2,011 eligible combos
     min_tgt_cells: int
-    # CRISPR 过滤开关（2026-09-28 补回：config_flow.py→yaml 迁移时丢失，缓存重建必崩）。
-    # 已被 common.perturb_direction 取代（列表白名单，见 CommonConfig），保留仅为兼容。
-    crispr_type_col: str
-    crispr_type_value: str
 
     def resolve_ntoken(self) -> int:
         """AE 方案（2026-10-06）：配了 ae_encoder_ckpt → 主模型序列=潜 token（latent+4）；
@@ -217,9 +173,9 @@ class ConfigUtils:
         如 inference 节供 BenchConfig（推理运行态参数，2026-09-28 用户定案）。
         """
         raw = cls.load_yaml(yaml_path)
-        section = dict(raw.get('common', {}))
+        section = dict(raw.get('network', {}))  # 2026-10-06：common 节删除，network 节作共享基底
         if issubclass(config_cls, FlowConfig):
-            flow = dict(raw.get('flow', {}))
+            flow = dict(raw.get('train', {}))  # 2026-10-06：flow 节更名 train
             for k in cls._subclass_override_fields(config_cls):
                 flow.pop(k, None)
             section.update(flow)
@@ -239,7 +195,7 @@ class ConfigUtils:
         """
         if config_cls is FlowConfig:
             return set()
-        # 子类自身声明的字段（__annotations__ 只含本类声明，含重定义字段如 batch_size；
+        # 子类自身声明的字段（__annotations__ 只含本类声明，含重定义字段如 batch_size_per_gpu；
         # 新增字段不在 flow 节里，pop 为无害 no-op）
         return set(config_cls.__dict__.get('__annotations__', {}))
 
