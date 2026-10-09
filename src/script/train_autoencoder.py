@@ -30,8 +30,8 @@ from src.utils.config_utils import ConfigUtils, FlowConfig  # noqa: E402
 def _eval_recon(enc, dec, x, device):
     """固定细胞集上的重建保真（centered per-gene corr 中位 + MSE）。x 预转常驻 GPU。"""
     with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        z, skips = enc(x)
-        r = dec(z, skips)
+        z = enc(x)
+        r = dec(z)
     xn = x.float().cpu().numpy()
     rn = r.float().cpu().numpy()
     xc = xn - xn.mean(0, keepdims=True)
@@ -49,7 +49,7 @@ def main():
     ap.add_argument('--batch', type=int, default=512)   # 每卡 batch（2026-10-06 用户定：1024→512）
     ap.add_argument('--lr', type=float, default=1e-4)
     ap.add_argument('--hidden', type=int, default=8192)
-    ap.add_argument('--latent', type=int, default=2048)   # 2026-10-07 加深版：latent 2048（h1=8192, h2=4096）
+    ap.add_argument('--latent', type=int, default=4096)   # 2026-10-08 回退浅版：单隐藏层 8192、latent 4096
     ap.add_argument('--eval-every', type=int, default=100)
     ap.add_argument('--max-steps', type=int, default=0, help='>0 时限制总步数（冒烟用）')
     ap.add_argument('--seed', type=int, default=0)
@@ -91,12 +91,13 @@ def main():
     steps_per_epoch = N // world // args.batch
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * steps_per_epoch)
 
-    # ---- 输出目录（2026-10-07 用户定案：autoencoder_<数据集后缀>，后缀取自缓存目录名
-    # cache_<后缀> 去前缀；固定 ckpt 目录，文件名带训练时间戳）
+    # ---- 输出目录（2026-10-08 用户定案：autoencoder_<数据集>_<n_in>-<n_latent>，
+    # 结构随名显式；后缀数据集取自缓存目录名 cache_<后缀> 去前缀）
     _cache_stem = os.path.basename(cfg.train_cache_dir.rstrip('/'))
     if _cache_stem.startswith('cache_'):
         _cache_stem = _cache_stem[len('cache_'):]
-    ckpt_dir = os.path.join(cfg.output_base_dir, f'autoencoder_{_cache_stem}')
+    ckpt_dir = os.path.join(cfg.output_base_dir,
+                            f'autoencoder_{_cache_stem}_{cfg.n_top_genes}-{args.latent}')
     run_ts = os.environ.get('SCDFM_RUN_TS') or time.strftime('%Y-%m-%d_%H-%M')
     if rank == 0:
         # 日志自落盘（2026-10-07 用户定案：与其他阶段同口径，任务名 pretrain_autoencoder）
@@ -165,8 +166,8 @@ def main():
                 size=(n_rows, n_genes),
             ).to(dev).to_dense().bfloat16()
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                z, skips = enc_m(x)
-                r = dec_m(z, skips)
+                z = enc_m(x)
+                r = dec_m(z)
                 loss = torch.nn.functional.mse_loss(r, x)
             opt.zero_grad()
             loss.backward()

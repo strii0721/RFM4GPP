@@ -4,6 +4,7 @@ import torch.nn as nn
 import tyro
 import glob
 import shutil
+import math
 from src.utils.config_utils import ConfigUtils, FlowConfig as Config
 import torch.nn.functional as F
 import time
@@ -94,7 +95,7 @@ def mmd2_unbiased_multi_sigma(X, Y, sigmas):
 
     return torch.stack(vals).mean()
 
-def train_step(source, target, res_target, perturbation_id, vf, criterion, accelerator, noise_type='Poisson', mode="predict_y"):
+def train_step(source, target, main_effect_row, perturbation_id, vf, criterion, accelerator, noise_type='Poisson', mode="predict_y"):
     B = source.shape[0]
     device = accelerator.device
     
@@ -112,39 +113,53 @@ def train_step(source, target, res_target, perturbation_id, vf, criterion, accel
     
     if mode=="predict_y" and _ae_mode:
         # AE 方案（2026-10-06 warm-start + 联合微调）：CFM 流匹配搬到潜空间，
-        # 监督目标只在基因空间（潜端点经 dec 回投影 vs res——梯度穿 dec→主模型→enc）。
+        # 监督目标只在基因空间（潜端点经 dec 回投影 vs Res——梯度穿 dec→主模型→enc）。
         t = torch.rand(B, device=device)
-        res_b = res_target.unsqueeze(0).expand(B, -1)          # (B, n_genes)
-        z_s, _ = _ae_enc(source)                                 # 源潜 (B, latent)
-        z1, skips1 = _ae_enc(res_b)                              # 目标潜端点（梯度回传）
+        # 细胞对级 Res（2026-10-08 定案）：数据层 OT 配对对照/扰动细胞 →
+        # r_pair = log2 fold（log1p 空间差 ÷ ln2）→ 减去 pseudobulk 主效应
+        src_p, tgt_p = ot_sampler.sample_plan(source, target)
+        res_cell = (tgt_p - src_p) / math.log(2.0) - main_effect_row[None, :]
+        z_s = _ae_enc(src_p)                                     # 源潜 (B, latent)
+        z1 = _ae_enc(res_cell)                                   # 目标潜端点（梯度回传）
         z0 = torch.randn_like(z1)
+        z0, z1 = ot_sampler.sample_plan(z0, z1)                  # 路径层 OT（潜空间）
         z_t = (1 - t)[:, None] * z0 + t[:, None] * z1           # 直线插值
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=getattr(config, 'use_bf16', False)):
             lid = _latent_ids.unsqueeze(0).expand(B, -1)   # (B, latent)——GeneEncoder 需 batch 维
             v_pred = vf(lid, z_t, t, z_s, perturbation_id, lid, mode=mode)
         loss_cfm = ((v_pred - (z1 - z0)) ** 2).mean()           # 潜空间 CFM 速度匹配
         z1_hat = z_t + v_pred * (1 - t)[:, None]                # 端点估计（潜）
-        res_hat = _ae_dec(z1_hat, skips1)                        # (B, n_genes)，对称跳连
-        loss = loss_cfm + F.mse_loss(res_hat, res_b)            # 基因空间端点（穿 dec）
+        res_hat = _ae_dec(z1_hat)                                # (B, n_genes)
+        loss = loss_cfm + F.mse_loss(res_hat, res_cell)         # 基因空间端点（穿 dec）
+        if config.use_mmd_loss:
+            # 细胞对级 MMD（2026-10-08 加回）：Res_cell 是真实细胞残差分布，多尺度 RBF
+            # 匹配分布形状（补 MSE 均值回归盲区）；梯度穿 dec→主模型→enc（联合微调）
+            sigmas = median_sigmas(res_cell.float(), scales=(0.5, 1.0, 2.0, 4.0))
+            loss = loss + mmd2_unbiased_multi_sigma(res_hat.float(), res_cell.float(), sigmas) * config.gamma
         return loss
 
     if mode=="predict_y":
-        # source, target = ot_sampler.sample_plan(source, target)
         t = torch.rand(B, device=device)
-        # 残差目标范式（2026-09-26 用户定案）：x₁ = Res（中心化 log2FC 残差），
-        # 噪声 = Gaussian（目标可负，不再用 lognormal-Poisson 噪声）
-        target_noise = torch.randn_like(source)
-        res_b = res_target[input_gene_ids].expand(B, -1)
-        path_x1 = path.sample(t=t, x_0=target_noise, x_1=res_b)
+        # 细胞对级 Res（2026-10-08 用户定案，双层 OT）：
+        # ① 数据层 OT：配对 source↔target，r_pair = log2 fold（log1p 空间差 ÷ ln2）
+        # ② 监督目标 x₁ = Res_cell = r_pair − (r̄_c + r̄_p − ḡ)（pseudobulk 主效应剥离）
+        # ③ 路径层 OT：噪声 x₀ 与 Res_cell 端点再配对（上游 OT-CFM 语义，路径短直）
+        src_p, tgt_p = ot_sampler.sample_plan(source, target)
+        res_cell = (tgt_p - src_p) / math.log(2.0) - main_effect_row[None, :]
+        source_cond = src_p[:, input_gene_ids]
+        res_b = res_cell[:, input_gene_ids]
+        target_noise = torch.randn_like(res_b)
+        x0, x1 = ot_sampler.sample_plan(target_noise, res_b)
+        path_x1 = path.sample(t=t, x_0=x0, x_1=x1)
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=getattr(config, 'use_bf16', False)):
-            predicted_x_t_velocity = vf(gene_input,path_x1.x_t, path_x1.t,source,perturbation_id, gene_input, mode=mode)
+            predicted_x_t_velocity = vf(gene_input,path_x1.x_t, path_x1.t,source_cond,perturbation_id, gene_input, mode=mode)
         loss = ((predicted_x_t_velocity - path_x1.dx_t)**2).mean()
         
         if config.use_mmd_loss:
             x1_hat = path_x1.x_t + predicted_x_t_velocity*(1-t).unsqueeze(-1)
             # fp32 for stable pairwise-distance kernels under bf16 training
             x1_hat_f = x1_hat.float()
-            target_f = res_b.float()
+            target_f = x1.float()
             sigmas = median_sigmas(target_f, scales=(0.5,1.0,2.0,4.0))
             _mmd_loss = mmd2_unbiased_multi_sigma(x1_hat_f, target_f, sigmas)
             loss = loss + _mmd_loss * config.gamma
@@ -397,14 +412,24 @@ if __name__ == "__main__":
     gene_ids = torch.tensor(gene_ids, dtype=torch.long, device=device)
 
     # 残差目标表（范式二，2026-09-26）：(line, pert) 冻结产物，列对齐缓存基因轴；
-    # mmap 懒加载（res_K562.npy 395MB 不常驻），每 rank 各持一份共享页
+    # mmap 懒加载（res_K562.npy 395MB 不常驻），每 rank 各持一份共享页。
+    # 2026-10-08 用户定案（细胞对级 Res + 双层 OT）：res_<line>.npy 组合级表闲置，
+    # 监督改为 OT 配对的细胞对残差 = r_pair − (r̄_c+r̄_p−ḡ)；三冻结向量 pseudobulk 口径不变。
     _res_lines = sorted(pd.read_csv(os.path.join(config.frozen_tensors_dir, 'combos.csv'))['line'].unique())
-    _res_tables = {L: np.load(os.path.join(config.frozen_tensors_dir, f'res_{L}.npy'),
-                              mmap_mode='r') for L in _res_lines}
-    assert all(t.shape[1] == gene_ids.shape[0] for t in _res_tables.values()), \
-        'residual table columns != cache gene axis'
+    _rbar_c_all = np.load(os.path.join(config.frozen_tensors_dir, 'rbar_c.npy'),
+                          mmap_mode='r')   # (n_lines, 19657)
+    _rbar_c_lines = pd.read_csv(os.path.join(config.frozen_tensors_dir, 'rbar_c_lines.csv'))['line'].tolist()
+    _rbar_c_rows = {L: np.array(_rbar_c_all[_rbar_c_lines.index(L)], dtype=np.float32)
+                    for L in _rbar_c_lines}
+    _rbar_p_all = np.load(os.path.join(config.frozen_tensors_dir, 'rbar_p.npy'),
+                          mmap_mode='r')   # (n_perts, 19657)
+    _rbar_p_perts = pd.read_csv(os.path.join(config.frozen_tensors_dir, 'rbar_p_perts.csv'))['pert'].tolist()
+    _rbar_p_rows = {p: np.array(_rbar_p_all[i], dtype=np.float32)
+                    for i, p in enumerate(_rbar_p_perts)}
+    _gbar = np.load(os.path.join(config.frozen_tensors_dir, 'gbar.npy')).astype(np.float32)
+    assert _gbar.shape[0] == gene_ids.shape[0], 'gbar != cache gene axis'
     print(f'##### residual targets loaded: lines={_res_lines}, '
-          f'cols={_res_tables[_res_lines[0]].shape[1]} #####', flush=True)
+          f'rbar_c={len(_rbar_c_lines)} rbar_p={len(_rbar_p_perts)} #####', flush=True)
 
     # 训练每步基因选择的采样池（2026-09-21 用户定案）：建模基因子集 = 完整基因轴
     # （固定集合，含 panel；panel 基因是其他扰动的真实 DEG，不可排除）。
@@ -487,16 +512,18 @@ if __name__ == "__main__":
                 perturbation_id = torch.tensor(vocab.encode(perturbation_name), dtype=torch.long, device=device)
                 perturbation_id = perturbation_id.repeat(source.shape[0], 1)
 
-            # 残差目标查表（范式二）：每批一个 (line, pert) 组合 -> Res 向量
+            # 主效应行（2026-10-08 定案）：r̄_c(line) + r̄_p(pert) − ḡ（pseudobulk 加性主效应，
+            # 全轴 19657）；细胞对残差在 train_step 内 = r_pair(OT 配对) − 主效应
             line_id = int(batch_data['line_id'].squeeze(0).item())
-            combo_row = int(batch_data['combo_row'].squeeze(0).item())
-            assert combo_row >= 0, f'combo missing from residual table (line_id={line_id})'
-            res_target = torch.from_numpy(
-                np.array(_res_tables[_res_lines[line_id]][combo_row], dtype=np.float32)).to(device)
-            # np.array（非 asarray）：mmap 切片非可写，torch 会告警且转出的张量语义不可靠
-            
+            _line = _res_lines[line_id]
+            _pert_name = perturbation_name[0]
+            _main_effect = (_rbar_c_rows.get(_line, np.zeros(_gbar.shape[0], np.float32))
+                            + _rbar_p_rows.get(_pert_name, np.zeros(_gbar.shape[0], np.float32))
+                            - _gbar)
+            main_effect = torch.from_numpy(_main_effect).to(device)
+
             set_requires_grad_for_p_only(vf, p_only=config.mode)
-            loss = train_step(source, target, res_target, perturbation_id, vf, criterion, accelerator, noise_type=config.noise_type, mode=config.mode)
+            loss = train_step(source, target, main_effect, perturbation_id, vf, criterion, accelerator, noise_type=config.noise_type, mode=config.mode)
             if accelerator.is_main_process:
                 window_loss += loss.item()
                 window_cnt += 1

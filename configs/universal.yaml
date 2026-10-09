@@ -27,7 +27,7 @@ network:
   mode: predict_y           # 前向模式（predict_y=扰动预测）
   # AE 潜空间维数（网络结构参数；编解码器 ckpt 路径在 train/inference 节，
   # 与 checkpoint_path 同类——2026-10-06 用户定案）
-  ae_latent_dim: 2048        # 2026-10-07 加深版定案：4096→2048，主模型潜序列 L=2048
+  ae_latent_dim: 4096        # 潜空间维度（2026-10-08 回退浅版：单隐藏层 8192、latent 4096）
 
 # ================= 训练启动（2026-10-06 拆段：训练超参/语料/数据口径/路径） =================
 train:
@@ -76,11 +76,11 @@ train:
   resume: ''                # 续训入口（CLI --resume <ckpt>；2026-10-05；checkpoint_path 已移除 2026-10-06）
   # AE 编解码器 ckpt（2026-10-06 用户定案：ckpt 路径与 checkpoint_path 同类，
   # 训练加载用 train 节、推理用 inference 节各配一份；两路径非空=AE 模式）
-  ae_encoder_ckpt: /share/ict2/Projects/scDFM/output/autoencoder_mrnh19657/encoder_2026-10-07_16-04.pt
-  ae_decoder_ckpt: /share/ict2/Projects/scDFM/output/autoencoder_mrnh19657/decoder_2026-10-07_16-04.pt
-  gamma: 0.5                # 论文 MMD λ=0.5（残差范式 use_mmd_loss=false 未启用）
+  ae_encoder_ckpt: /home/ict2/Projects/scDFM/output/autoencoder_mrnh19657_19657-4096/encoder_2026-10-08_09-17.pt
+  ae_decoder_ckpt: /home/ict2/Projects/scDFM/output/autoencoder_mrnh19657_19657-4096/decoder_2026-10-08_09-17.pt
+  gamma: 0.5                # 论文 MMD λ=0.5
   split_method: whole       # replogle 留系：train 全量训练，测试语料=独立 RPE1 文件
-  use_mmd_loss: false       # 残差目标范式去 MMD（2026-09-26 用户定案）
+  use_mmd_loss: true        # 2026-10-08 加回：细胞对级 Res 后 MMD 匹配真实残差分布（AE+非 AE 分支）
   fold: 0
   data_path: /home/ict2/Projects/scDFM/tmp
   gpus: 8                     # torchrun --nproc_per_node 须与此一致（2026-10-07：batch 口径 = batch_size_per_gpu，不再有 batch_total）
@@ -103,10 +103,10 @@ inference:
   # main 模型 ckpt（2026-10-06 用户定案：推理三模型分别 yaml 指定——
   # 训练目录自动取 main_best.pt，或直接填 main_*.pt 文件路径；AE 两路径同节）
   # 2026-10-06 晚：worker03 正式推理——三权重全用 15000 轮（best）
-  checkpoint_path: /home/ict2/Projects/scDFM/output/train_2026-10-07_17-26/best
+  checkpoint_path: /home/ict2/Projects/scDFM/output/train_2026-10-08_11-35/best
   # AE 编解码器 ckpt（与 checkpoint_path 同类放 inference；两路径非空=AE 模式）
-  ae_encoder_ckpt: /home/ict2/Projects/scDFM/output/autoencoder_mrnh19657/encoder_2026-10-07_16-04.pt
-  ae_decoder_ckpt: /home/ict2/Projects/scDFM/output/autoencoder_mrnh19657/decoder_2026-10-07_16-04.pt
+  ae_encoder_ckpt: /home/ict2/Projects/scDFM/output/autoencoder_mrnh19657_19657-4096/encoder_2026-10-08_09-17.pt
+  ae_decoder_ckpt: /home/ict2/Projects/scDFM/output/autoencoder_mrnh19657_19657-4096/decoder_2026-10-08_09-17.pt
   # 测试集（留系真实侧，独立文件；whole 口径专用）
   test_set_paths: /ssd3/PubData/gene_alignment/Replogle_RPE1/Replogle_RPE1.h5ad
   # 推理 control 来源（2026-09-30 用户定案）：多个数据集，各取 target_gene ==
@@ -147,11 +147,11 @@ inference:
 benchmark:
   output_base_dir: output # 输出基地址；实际目录 = <基地址>/benchmark_<YYYY-MM-DD_HH-MM>
   log_base_dir: logs      # 日志基地址；拼 <基>/benchmark_<ts>/prep_<stem>.log
-  pred_h5ad: output/inference_2026-10-07_23-35/predictions.h5ad  # 提交前填：推理产物（如 output/inference_<ts>/pred.h5ad）
+  pred_h5ad: output/inference_2026-10-09_00-11/predictions.h5ad  # 提交前填：推理产物（如 output/inference_<ts>/pred.h5ad）
   out_vcc: ''             # .vcc 输出路径（空=默认 <实际目录>/<pred stem>.vcc）
   controls_dir: /home/ict2/Projects/vcc-2026/resources/datasets/controls
   genes_vcc: /home/ict2/Projects/vcc-2026/resources/datasets/controls/gene_names.csv  # 提交轴基因清单（18533）
-  model_name: scDFM
+  model_name: ''            # 空=每次提交随机 8 位 hex 哈希名（2026-10-08 用户定案）
   resume_upload: false    # 上传中断续传（aborted upload 锁团队槽位时必须 true）
   no_wait: false          # true=提交后不阻塞等评分
   dry_run: false          # true=prep 只校验不产出、不提交

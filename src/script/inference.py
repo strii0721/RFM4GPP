@@ -227,15 +227,19 @@ def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[s
                else sparse.csr_matrix(real.X[ctl_idx_all]))  # raw counts 子矩阵
     ctl_norm = _norm_log1p(ctl_raw)                # log1p(CP10k)
 
-    # 残差目标常量（范式二）：r̄_p / ḡ，按 modeled 序对齐（r̄_c(RPE1)=0 用户定案）
+    # 残差目标常量（范式二）：r̄_p / ḡ / mean(r̄_c)，按 modeled 序对齐。
+    # 2026-10-08 用户定案：恢复式 r̂ = mean(r̄_c) + r̄_p − ḡ + Reŝ——推理 context 无系
+    # 对应行，r̄_c 取全部系均值（用户定案；数值上 = ḡ，与 −ḡ 抵消，显式保留语义）
     rbar_p_all = np.load(os.path.join(cfg.frozen_tensors_dir, 'rbar_p.npy'), mmap_mode='r')
     rbar_p_perts = pd.read_csv(os.path.join(cfg.frozen_tensors_dir, 'rbar_p_perts.csv'))['pert'].tolist()
     gbar_all = np.load(os.path.join(cfg.frozen_tensors_dir, 'gbar.npy'))
+    rbar_c_all = np.load(os.path.join(cfg.frozen_tensors_dir, 'rbar_c.npy'), mmap_mode='r')
     cache_genes = pd.read_csv(os.path.join(cfg.frozen_tensors_dir, 'genes_cache.csv'))['gene'].tolist()
     assert set(cache_genes) == set(modeled), 'residual genes_cache != modeled axis'
     align = np.array([cache_genes.index(g) for g in modeled], dtype=np.int64)
     rbar_p = np.asarray(rbar_p_all[:, align], dtype=np.float32)   # (n_perts, |modeled|)
     gbar = np.asarray(gbar_all[align], dtype=np.float32)
+    rbar_c_mean = np.asarray(rbar_c_all[:, align].mean(axis=0), dtype=np.float32)  # 全部系均值
 
     gene_axis_pos = {g: i for i, g in enumerate(real.var_names)}
     # 对照子矩阵的列轴 = 全轴（real 未做过列过滤）
@@ -302,14 +306,14 @@ def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[s
             # AE 模式（2026-10-06）：表达 → enc → 潜空间 ODE → dec → Reŝ（基因空间）
             ae_enc, ae_dec = ae
             with torch.no_grad():
-                src_latent, src_skips = ae_enc(src_modeled)
+                src_latent = ae_enc(src_modeled)
                 pred_latent = ode_predict(
                     vf, gene_ids, src_latent, pert_id_b, cfg.batch_size_per_gpu, cfg.ode_steps,
                     cfg.noise_type, getattr(cfg, 'poisson_alpha', 0.8),
                     getattr(cfg, 'poisson_target_sum', 1e4), device,
                     clamp_output=False,
                 )
-                pred_modeled = ae_dec(pred_latent, src_skips).cpu().numpy()
+                pred_modeled = ae_dec(pred_latent).cpu().numpy()
         else:
             pred_modeled = ode_predict(
                 vf, gene_ids, src_modeled, pert_id_b, cfg.batch_size_per_gpu, cfg.ode_steps,
@@ -328,7 +332,7 @@ def build_pred(cfg: BenchConfig, vf, gene_ids, vocab: GeneVocab, modeled: list[s
             # 如 panel 中 DNTTIP1/EEF1A2/EPHB2/FZD2/MSANTD4/NT5DC1）无 r̄_p 行——
             # 取 0 → r̂ = Reŝ（ḡ≈0 实测 mean -2.6e-8，可忽略），纯残差预测。
             rbar_p_row = np.zeros((1, rbar_p.shape[1]), dtype=np.float32)
-        rhat = (rbar_p_row - gbar[None, :]) + pred_modeled   # (n, L)
+        rhat = (rbar_c_mean[None, :] + rbar_p_row - gbar[None, :]) + pred_modeled   # (n, L)
         tpos = int(np.nonzero(modeled_pos_full == gene_axis_pos[pert])[0][0])
         rhat[:, tpos] = -np.inf
         # 发散值裁剪（2026-10-07 修复 lam value too large）：模型对个别任务输出极端

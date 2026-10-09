@@ -142,8 +142,12 @@ def main() -> None:
             args.append('--resume')
         if not cfg.no_wait:
             args.append('--wait')
-        _run([vcc, 'submit', out_vcc, '-m', cfg.model_name] + args)
-        print(f'done submit: {out_vcc} (model={cfg.model_name})')
+        # 模型名随机哈希（2026-10-08 用户定案）：yaml 未显式指定时每次提交随机 8 位 hex
+        # 代替固定名（leaderboard 匿名随机、防识别）；yaml 填了 model_name 则用之
+        import uuid
+        _mname = cfg.model_name.strip() or uuid.uuid4().hex[:8]
+        _run([vcc, 'submit', out_vcc, '-m', _mname] + args)
+        print(f'done submit: {out_vcc} (model={_mname})')
         print(f'log: {log_file}')
     finally:
         os.unlink(gene_csv_tmp)

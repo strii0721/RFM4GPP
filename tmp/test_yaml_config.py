@@ -24,16 +24,16 @@ assert (f.n_ctrl_cells, f.n_pred_cells, f.n_real_cells, f.min_real_cells) == (0,
 assert f.test_set_paths == '', f.test_set_paths  # 2026-10-06 拆段：test_set_paths 在 inference 节，训练入口默认空
 assert f.frozen_tensors_dir == '/home/ict2/Projects/scDFM/output/tensors_mrnh19657', f.frozen_tensors_dir
 assert f.train_cache_dir == '/home/ict2/Projects/scDFM/cache/cache_mrnh19657', f.train_cache_dir
-assert f.ae_encoder_ckpt.endswith('autoencoder_mrnh19657/encoder_2026-10-07_16-04.pt'), f.ae_encoder_ckpt
-assert f.ae_decoder_ckpt.endswith('autoencoder_mrnh19657/decoder_2026-10-07_16-04.pt'), f.ae_decoder_ckpt
-assert f.ae_latent_dim == 2048, f.ae_latent_dim
-assert f.resolve_ntoken() == 2048 + 4, f.resolve_ntoken()  # AE 模式=潜词表
+assert f.ae_encoder_ckpt.endswith('autoencoder_mrnh19657_19657-4096/encoder_2026-10-08_09-17.pt'), f.ae_encoder_ckpt
+assert f.ae_decoder_ckpt.endswith('autoencoder_mrnh19657_19657-4096/decoder_2026-10-08_09-17.pt'), f.ae_decoder_ckpt
+assert f.ae_latent_dim == 4096, f.ae_latent_dim
+assert f.resolve_ntoken() == 4096 + 4, f.resolve_ntoken()  # AE 模式=潜词表
 assert f.resolve_pert_ntoken() == f.ntoken, f.resolve_pert_ntoken()  # 扰动表独立
 assert f.panel_csv_path.endswith('mrnh19657/pert_counts.csv'), f.panel_csv_path
 assert (f.ntoken, f.n_top_genes, f.infer_top_gene) == (19661, 19657, 19657)
 assert f.inference_control_paths == [], f.inference_control_paths  # 2026-10-06 拆段：control 源在 inference 节
 assert f.cache_workers == 18
-assert f.split_method == 'whole' and f.use_mmd_loss is False
+assert f.split_method == 'whole' and f.use_mmd_loss is True
 print('[1] FlowConfig 全部值来自 YAML OK')
 
 # 2) CLI 覆盖 YAML
@@ -84,7 +84,7 @@ c = ConfigUtils.load(FlowConfig, use_cli=False)  # network + train
 assert c.frozen_tensors_dir == '/home/ict2/Projects/scDFM/output/tensors_mrnh19657'
 assert c.perturb_direction == ['CRISPRi'], c.perturb_direction
 assert (c.n_ctrl_cells, c.n_pred_cells) == (0, 0), (c.n_ctrl_cells, c.n_pred_cells)  # 训练入口默认空
-assert c.fusion_method == 'differential_transformer' and c.ae_latent_dim == 2048, 'network 段未合并'
+assert c.fusion_method == 'differential_transformer' and c.ae_latent_dim == 4096, 'network 段未合并'
 b = ConfigUtils.load(FlowConfig, use_cli=False, extra_sections=('build_tensors',))
 assert (b.n_ctrl_cells, b.n_pred_cells, b.n_real_cells, b.min_real_cells) == (18400, 400, 2000, 100)
 print('[6] 阶段段拆分（network+train 合并、build_tensors 覆盖）OK')
